@@ -73,7 +73,7 @@
                     <Button Content="Biblioteca" Height="42" Margin="0,0,0,8" HorizontalContentAlignment="Left" Padding="14,0" />
                     <Button Content="Crimson Desert" Height="42" HorizontalContentAlignment="Left" Padding="14,0" />
                 </StackPanel>
-                <TextBlock DockPanel.Dock="Bottom" Text="v0.2.5 • Stats Probe" Foreground="{StaticResource MutedTextBrush}" FontSize="12" />
+                <TextBlock DockPanel.Dock="Bottom" Text="v0.2.6 • ActorManager Probe" Foreground="{StaticResource MutedTextBrush}" FontSize="12" />
             </DockPanel>
         </Border>
 
