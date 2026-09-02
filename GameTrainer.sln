@@ -1,0 +1,30 @@
+Microsoft Visual Studio Solution File, Format Version 12.00
+# Visual Studio Version 17
+VisualStudioVersion = 17.0.31903.59
+MinimumVisualStudioVersion = 10.0.40219.1
+Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "GameTrainer.Core", "src\GameTrainer.Core\GameTrainer.Core.csproj", "{A4D70604-4F34-4E58-AF76-75D25B1A2B04}"
+EndProject
+Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "GameTrainer.Modules.CrimsonDesert", "src\GameTrainer.Modules.CrimsonDesert\GameTrainer.Modules.CrimsonDesert.csproj", "{B73A2B3A-BC69-4A99-87BB-827DF48615FA}"
+EndProject
+Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "GameTrainer.App", "src\GameTrainer.App\GameTrainer.App.csproj", "{A8B9564F-6275-4E19-9C2F-93EA867D19ED}"
+EndProject
+Global
+    GlobalSection(SolutionConfigurationPlatforms) = preSolution
+        Debug|Any CPU = Debug|Any CPU
+        Release|Any CPU = Release|Any CPU
+    EndGlobalSection
+    GlobalSection(ProjectConfigurationPlatforms) = postSolution
+        {A4D70604-4F34-4E58-AF76-75D25B1A2B04}.Debug|Any CPU.ActiveCfg = Debug|Any CPU
+        {A4D70604-4F34-4E58-AF76-75D25B1A2B04}.Debug|Any CPU.Build.0 = Debug|Any CPU
+        {A4D70604-4F34-4E58-AF76-75D25B1A2B04}.Release|Any CPU.ActiveCfg = Release|Any CPU
+        {A4D70604-4F34-4E58-AF76-75D25B1A2B04}.Release|Any CPU.Build.0 = Release|Any CPU
+        {B73A2B3A-BC69-4A99-87BB-827DF48615FA}.Debug|Any CPU.ActiveCfg = Debug|Any CPU
+        {B73A2B3A-BC69-4A99-87BB-827DF48615FA}.Debug|Any CPU.Build.0 = Debug|Any CPU
+        {B73A2B3A-BC69-4A99-87BB-827DF48615FA}.Release|Any CPU.ActiveCfg = Release|Any CPU
+        {B73A2B3A-BC69-4A99-87BB-827DF48615FA}.Release|Any CPU.Build.0 = Release|Any CPU
+        {A8B9564F-6275-4E19-9C2F-93EA867D19ED}.Debug|Any CPU.ActiveCfg = Debug|Any CPU
+        {A8B9564F-6275-4E19-9C2F-93EA867D19ED}.Debug|Any CPU.Build.0 = Debug|Any CPU
+        {A8B9564F-6275-4E19-9C2F-93EA867D19ED}.Release|Any CPU.ActiveCfg = Release|Any CPU
+        {A8B9564F-6275-4E19-9C2F-93EA867D19ED}.Release|Any CPU.Build.0 = Release|Any CPU
+    EndGlobalSection
+EndGlobal
