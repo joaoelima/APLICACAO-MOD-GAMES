@@ -1,0 +1,13 @@
+<Application x:Class="GameTrainer.App.App"
+             xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+             xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+             StartupUri="MainWindow.xaml">
+    <Application.Resources>
+        <SolidColorBrush x:Key="BackgroundBrush" Color="#0B0D0F" />
+        <SolidColorBrush x:Key="PanelBrush" Color="#111417" />
+        <SolidColorBrush x:Key="CardBrush" Color="#15191D" />
+        <SolidColorBrush x:Key="TextBrush" Color="#F4F5F6" />
+        <SolidColorBrush x:Key="MutedTextBrush" Color="#949AA1" />
+        <SolidColorBrush x:Key="AccentBrush" Color="#3CD3B4" />
+    </Application.Resources>
+</Application>
