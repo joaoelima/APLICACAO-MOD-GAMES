@@ -171,7 +171,7 @@ public partial class MainWindow : Window
             ? "Processo: não conectado"
             : $"Processo: {_memory.Process.ProcessName}.exe | PID {_memory.Process.Id} | versão {version ?? "desconhecida"}";
 
-        var report = $"Game Trainer v0.2.4{Environment.NewLine}" +
+        var report = $"Game Trainer v0.2.5{Environment.NewLine}" +
                      $"{processInfo}{Environment.NewLine}" +
                      $"Status: {_module.RuntimeStatus}{Environment.NewLine}{Environment.NewLine}" +
                      _module.DiagnosticReport;
@@ -277,16 +277,6 @@ public partial class MainWindow : Window
         _isClosing = true;
         _processTimer.Stop();
         _trainerTimer.Stop();
-
-        try
-        {
-            if (_memory.IsAttached)
-                _module.SetToggleAsync("one-hit-kill", false).GetAwaiter().GetResult();
-        }
-        catch
-        {
-        }
-
         _memory.Dispose();
         base.OnClosed(e);
     }
