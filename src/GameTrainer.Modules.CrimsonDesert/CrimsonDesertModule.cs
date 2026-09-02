@@ -7,23 +7,21 @@ namespace GameTrainer.Modules.CrimsonDesert;
 
 public sealed class CrimsonDesertModule : IGameModule, IDisposable
 {
-    private const int HookLength = 11;
-    private const int CaveSize = 0x100;
-    private const int CapturePlayerSlotOffset = 0x80;
-    private const int CaptureComponentSlotOffset = 0x88;
+    private const int PlayerHookLength = 11;
+    private const int PlayerCaveSize = 0x100;
+    private const int PlayerSlotOffset = 0x80;
+    private const int ComponentSlotOffset = 0x88;
 
     private const int StatHookLength = 9;
     private const int StatCaveSize = 0x100;
-    private const int StatCaptureSlotOffset = 0x80;
+    private const int StatSlotOffset = 0x80;
 
     private const int HealthIdOffset = 0x000;
     private const int HealthCurrentOffset = 0x008;
     private const int HealthMaxOffset = 0x018;
-
     private const int StaminaIdOffset = 0x510;
     private const int StaminaCurrentOffset = 0x518;
     private const int StaminaMaxOffset = 0x528;
-
     private const int SpiritIdOffset = 0x5A0;
     private const int SpiritCurrentOffset = 0x5A8;
     private const int SpiritMaxOffset = 0x5B8;
@@ -40,24 +38,24 @@ public sealed class CrimsonDesertModule : IGameModule, IDisposable
     private const string CurrentPlayerLegacyShortAob =
         "48 8B 43 68 48 8B 88 B0 01 00 00";
 
-    // AOB usada pela própria CT no script "Max Health + Stamina + Spirit (Godmode)".
+    // AOB exata usada pela CT no script StaminaInj/Godmode.
     private const string StatWriteAob = "48 89 5F 08 48 8B 5C 24 48";
 
     private ProcessMemory? _memory;
     private RuntimeState _runtime = new();
 
-    private nint _hookAddress;
-    private nint _codeCave;
-    private nint _capturePlayerSlot;
-    private nint _captureComponentSlot;
-    private byte[]? _originalHookBytes;
-    private bool _hookInstalled;
-    private string _hookSignature = "não resolvida";
+    private nint _playerHookAddress;
+    private nint _playerCave;
+    private nint _playerSlot;
+    private nint _componentSlot;
+    private byte[]? _playerOriginalBytes;
+    private bool _playerHookInstalled;
+    private string _playerSignature = "não resolvida";
 
     private nint _statHookAddress;
-    private nint _statCodeCave;
-    private nint _statCaptureSlot;
-    private byte[]? _statOriginalHookBytes;
+    private nint _statCave;
+    private nint _statSlot;
+    private byte[]? _statOriginalBytes;
     private bool _statHookInstalled;
 
     private bool _health;
@@ -112,23 +110,20 @@ public sealed class CrimsonDesertModule : IGameModule, IDisposable
         LastError = string.Empty;
 
         var logs = new List<string>();
+        InstallPlayerHook(out var playerLog);
+        logs.Add(playerLog);
 
-        if (InstallCurrentPlayerHook(out var playerHookLog))
-            logs.Add(playerHookLog);
-        else
-            logs.Add(playerHookLog);
-
-        if (!InstallStatWriteHook(out var statHookLog))
+        if (!InstallStatHook(out var statLog))
         {
-            logs.Add(statHookLog);
+            logs.Add(statLog);
             DiagnosticReport = string.Join(Environment.NewLine, logs.Where(x => !string.IsNullOrWhiteSpace(x)));
             RuntimeStatus = "Jogo conectado, mas o hook direto de stats da CT não pôde ser instalado.";
             LastError = RuntimeStatus;
             return;
         }
 
-        logs.Add(statHookLog);
-        await WaitForPlayerAndResolveAsync(string.Join(Environment.NewLine, logs), cancellationToken);
+        logs.Add(statLog);
+        await WaitForStatsAsync(string.Join(Environment.NewLine, logs), cancellationToken);
     }
 
     public async Task<bool> ReprobeAsync(CancellationToken cancellationToken = default)
@@ -143,15 +138,16 @@ public sealed class CrimsonDesertModule : IGameModule, IDisposable
         _runtime = new RuntimeState();
         var logs = new List<string>();
 
-        if (!_hookInstalled)
-            InstallCurrentPlayerHook(out var playerLog);
+        string playerLog;
+        if (!_playerHookInstalled)
+            InstallPlayerHook(out playerLog);
         else
-            playerLog = BuildHookHeader();
+            playerLog = BuildPlayerHeader();
         logs.Add(playerLog);
 
         if (!_statHookInstalled)
         {
-            if (!InstallStatWriteHook(out var statLog))
+            if (!InstallStatHook(out var statLog))
             {
                 logs.Add(statLog);
                 DiagnosticReport = string.Join(Environment.NewLine, logs.Where(x => !string.IsNullOrWhiteSpace(x)));
@@ -163,10 +159,10 @@ public sealed class CrimsonDesertModule : IGameModule, IDisposable
         }
         else
         {
-            logs.Add(BuildStatHookHeader());
+            logs.Add(BuildStatHeader());
         }
 
-        return await WaitForPlayerAndResolveAsync(string.Join(Environment.NewLine, logs), cancellationToken);
+        return await WaitForStatsAsync(string.Join(Environment.NewLine, logs), cancellationToken);
     }
 
     public Task<bool> SetToggleAsync(string featureId, bool enabled, CancellationToken cancellationToken = default)
@@ -209,18 +205,12 @@ public sealed class CrimsonDesertModule : IGameModule, IDisposable
             return Task.CompletedTask;
 
         if (_statHookInstalled && TryReadCapturedStats(out var stats)
-            && stats != 0
-            && stats != _runtime.StatsBase
-            && TryResolveDirectStats(stats, out var runtime, out var directDiagnostic))
+            && stats != 0 && stats != _runtime.StatsBase
+            && TryResolveDirectStats(stats, out var runtime, out var diagnostic))
         {
-            if (TryReadCapturedPointers(out var player, out var component))
-            {
-                runtime.CapturedPlayer = player;
-                runtime.PlayerComponent = component;
-            }
-
+            FillCapturedPlayer(runtime);
             _runtime = runtime;
-            DiagnosticReport = BuildCombinedHeader() + Environment.NewLine + directDiagnostic;
+            DiagnosticReport = BuildCombinedHeader() + Environment.NewLine + diagnostic;
             RuntimeStatus = "Pronto • stats do jogador capturados diretamente pela rotina CT";
             LastError = string.Empty;
         }
@@ -234,52 +224,42 @@ public sealed class CrimsonDesertModule : IGameModule, IDisposable
         if (_health) RestoreCurrentToMaximum(_runtime.HealthCurrent, _runtime.HealthMax, "Vida");
         if (_stamina) RestoreCurrentToMaximum(_runtime.StaminaCurrent, _runtime.StaminaMax, "Vigor");
         if (_spirit) RestoreCurrentToMaximum(_runtime.SpiritCurrent, _runtime.SpiritMax, "Espírito");
-
         return Task.CompletedTask;
     }
 
-    private async Task<bool> WaitForPlayerAndResolveAsync(string hookLog, CancellationToken cancellationToken)
+    private async Task<bool> WaitForStatsAsync(string header, CancellationToken cancellationToken)
     {
-        var log = new List<string> { hookLog };
+        var log = new List<string> { header };
         RuntimeStatus = "Hooks instalados. Aguardando a rotina de escrita de stats identificar o jogador...";
 
         for (var attempt = 0; attempt < 120; attempt++)
         {
             cancellationToken.ThrowIfCancellationRequested();
-
             if (TryReadCapturedStats(out var stats) && stats != 0)
             {
-                if (TryResolveDirectStats(stats, out var runtime, out var directLog))
+                if (TryResolveDirectStats(stats, out var runtime, out var diagnostic))
                 {
-                    if (TryReadCapturedPointers(out var player, out var component))
-                    {
-                        runtime.CapturedPlayer = player;
-                        runtime.PlayerComponent = component;
-                    }
-
+                    FillCapturedPlayer(runtime);
                     _runtime = runtime;
-                    log.Add(directLog);
+                    log.Add(diagnostic);
                     DiagnosticReport = string.Join(Environment.NewLine, log.Where(x => !string.IsNullOrWhiteSpace(x)).Distinct());
                     RuntimeStatus = "Pronto • stats do jogador capturados diretamente pela rotina CT";
                     LastError = string.Empty;
                     return true;
                 }
-
-                log.Add(directLog);
+                log.Add(diagnostic);
             }
-
             await Task.Delay(50, cancellationToken);
         }
 
-        if (TryReadCapturedStats(out var finalStats))
-            log.Add($"Capture Stats/RDI final: 0x{finalStats.ToInt64():X}");
-        else
-            log.Add("Capture Stats/RDI final: leitura inválida");
+        log.Add(TryReadCapturedStats(out var finalStats)
+            ? $"Capture Stats/RDI final: 0x{finalStats.ToInt64():X}"
+            : "Capture Stats/RDI final: leitura inválida");
 
-        if (TryReadCapturedPointers(out var finalPlayer, out var finalComponent))
+        if (TryReadCapturedPlayer(out var player, out var component))
         {
-            log.Add($"Capture cplayer final: 0x{finalPlayer.ToInt64():X}");
-            log.Add($"Capture csplayer final: 0x{finalComponent.ToInt64():X}");
+            log.Add($"Capture cplayer final: 0x{player.ToInt64():X}");
+            log.Add($"Capture csplayer final: 0x{component.ToInt64():X}");
         }
 
         DiagnosticReport = string.Join(Environment.NewLine, log.Where(x => !string.IsNullOrWhiteSpace(x)).Distinct());
@@ -288,15 +268,13 @@ public sealed class CrimsonDesertModule : IGameModule, IDisposable
         return false;
     }
 
-    private bool InstallStatWriteHook(out string diagnostic)
+    private bool InstallStatHook(out string diagnostic)
     {
         diagnostic = string.Empty;
-        if (_memory is null || !_memory.IsAttached)
-            return false;
-
+        if (_memory is null || !_memory.IsAttached) return false;
         if (_statHookInstalled)
         {
-            diagnostic = BuildStatHookHeader();
+            diagnostic = BuildStatHeader();
             return true;
         }
 
@@ -305,7 +283,7 @@ public sealed class CrimsonDesertModule : IGameModule, IDisposable
             "Stat Capture v0.3.3 - CT StaminaInj",
             "AOB CT: 48 89 5F 08 48 8B 5C 24 48",
             "Filtro CT: [RDI+5A0] == 19",
-            "Ação do trainer: somente captura RDI; não replica os writes 999999999 da CT"
+            "Ação: somente captura RDI; não escreve 999999999"
         };
 
         try
@@ -319,37 +297,30 @@ public sealed class CrimsonDesertModule : IGameModule, IDisposable
             }
 
             _statHookAddress = match.Value;
-            _statOriginalHookBytes = _memory.ReadBytes(_statHookAddress, StatHookLength);
+            _statOriginalBytes = _memory.ReadBytes(_statHookAddress, StatHookLength);
             var expected = new byte[] { 0x48, 0x89, 0x5F, 0x08, 0x48, 0x8B, 0x5C, 0x24, 0x48 };
-            if (!_statOriginalHookBytes.SequenceEqual(expected))
+            if (!_statOriginalBytes.SequenceEqual(expected))
             {
-                log.Add($"AOB StaminaInj: 0x{_statHookAddress.ToInt64():X}, bytes inesperados: {Convert.ToHexString(_statOriginalHookBytes)}");
+                log.Add($"AOB StaminaInj: bytes inesperados {Convert.ToHexString(_statOriginalBytes)}");
                 diagnostic = string.Join(Environment.NewLine, log);
                 return false;
             }
 
-            _statCodeCave = _memory.AllocateExecutableNear(_statHookAddress, StatCaveSize);
-            _statCaptureSlot = _statCodeCave + StatCaptureSlotOffset;
-            _memory.Write<long>(_statCaptureSlot, 0);
-
-            var caveCode = BuildStatCaptureCave(
-                _statCodeCave,
-                _statCaptureSlot,
-                _statHookAddress,
-                _statOriginalHookBytes);
-            _memory.WriteBytes(_statCodeCave, caveCode);
+            _statCave = _memory.AllocateExecutableNear(_statHookAddress, StatCaveSize);
+            _statSlot = _statCave + StatSlotOffset;
+            _memory.Write<long>(_statSlot, 0);
+            _memory.WriteBytes(_statCave, BuildStatCaptureCave(_statCave, _statSlot, _statHookAddress, _statOriginalBytes));
 
             var patch = new byte[StatHookLength];
             patch[0] = 0xE9;
-            BinaryPrimitives.WriteInt32LittleEndian(patch.AsSpan(1, 4), CheckedRel32(_statHookAddress + 5, _statCodeCave));
+            BinaryPrimitives.WriteInt32LittleEndian(patch.AsSpan(1, 4), CheckedRel32(_statHookAddress + 5, _statCave));
             Array.Fill(patch, (byte)0x90, 5, StatHookLength - 5);
             _memory.WriteProtectedBytes(_statHookAddress, patch);
             _statHookInstalled = true;
 
             log.Add($"AOB StaminaInj: 0x{_statHookAddress.ToInt64():X} (RVA 0x{_statHookAddress.ToInt64() - _memory.MainModuleBase.ToInt64():X})");
-            log.Add($"Stat cave: 0x{_statCodeCave.ToInt64():X}");
-            log.Add($"Capture Stats/RDI: 0x{_statCaptureSlot.ToInt64():X}");
-            log.Add("Hook direto de stats: instalado");
+            log.Add($"Stat cave: 0x{_statCave.ToInt64():X}");
+            log.Add($"Capture Stats/RDI: 0x{_statSlot.ToInt64():X}");
             diagnostic = string.Join(Environment.NewLine, log);
             return true;
         }
@@ -362,41 +333,30 @@ public sealed class CrimsonDesertModule : IGameModule, IDisposable
         }
     }
 
-    private static byte[] BuildStatCaptureCave(
-        nint cave,
-        nint captureSlot,
-        nint hookAddress,
-        byte[] originalBytes)
+    private static byte[] BuildStatCaptureCave(nint cave, nint slot, nint hook, byte[] originalBytes)
     {
         var code = new List<byte>(96);
-
         code.Add(0x9C); // pushfq
-        code.AddRange(new byte[] { 0x81, 0xBF, 0xA0, 0x05, 0x00, 0x00, 0x13, 0x00, 0x00, 0x00 }); // cmp dword ptr [rdi+5A0],19
-        code.AddRange(new byte[] { 0x75, 0x0F }); // jne +15 (pula captura, vai para popfq)
+        code.AddRange(new byte[] { 0x81, 0xBF, 0xA0, 0x05, 0x00, 0x00, 0x13, 0x00, 0x00, 0x00 }); // cmp [rdi+5A0],19
+        code.AddRange(new byte[] { 0x75, 0x0F }); // jne popfq
         code.Add(0x50); // push rax
-        code.AddRange(new byte[] { 0x48, 0xB8 }); // mov rax,imm64
-        code.AddRange(BitConverter.GetBytes(captureSlot.ToInt64()));
+        code.AddRange(new byte[] { 0x48, 0xB8 });
+        code.AddRange(BitConverter.GetBytes(slot.ToInt64()));
         code.AddRange(new byte[] { 0x48, 0x89, 0x38 }); // mov [rax],rdi
         code.Add(0x58); // pop rax
         code.Add(0x9D); // popfq
-
-        code.AddRange(originalBytes); // mov [rdi+08],rbx ; mov rbx,[rsp+48]
-
-        var jumpInstruction = cave + code.Count;
+        code.AddRange(originalBytes);
+        var jump = cave + code.Count;
         code.Add(0xE9);
-        code.AddRange(BitConverter.GetBytes(CheckedRel32(jumpInstruction + 5, hookAddress + StatHookLength)));
+        code.AddRange(BitConverter.GetBytes(CheckedRel32(jump + 5, hook + StatHookLength)));
         return code.ToArray();
     }
 
     private bool TryReadCapturedStats(out nint stats)
     {
         stats = 0;
-        if (_memory is null || !_memory.IsAttached || !_statHookInstalled || _statCaptureSlot == 0)
-            return false;
-
-        if (!_memory.TryRead<long>(_statCaptureSlot, out var raw))
-            return false;
-
+        if (_memory is null || !_memory.IsAttached || !_statHookInstalled || _statSlot == 0) return false;
+        if (!_memory.TryRead<long>(_statSlot, out var raw)) return false;
         stats = (nint)raw;
         return stats == 0 || (ProcessMemory.IsLikelyPointer(stats) && _memory.IsReadable(stats));
     }
@@ -411,8 +371,7 @@ public sealed class CrimsonDesertModule : IGameModule, IDisposable
         }
 
         var log = new List<string> { $"Captured Stats/RDI: 0x{stats.ToInt64():X}" };
-
-        if (!_memory.TryRead<int>(stats + HealthIdOffset, out var healthId)
+        if (!_memory.TryRead<int>(stats + HealthIdOffset, out var hpId)
             || !_memory.TryRead<int>(stats + StaminaIdOffset, out var staminaId)
             || !_memory.TryRead<int>(stats + SpiritIdOffset, out var spiritId))
         {
@@ -420,11 +379,10 @@ public sealed class CrimsonDesertModule : IGameModule, IDisposable
             return false;
         }
 
-        log.Add($"Stat IDs diretos: HP={healthId}, Vigor={staminaId}, Espírito={spiritId}");
-        if (healthId != ExpectedHealthId || spiritId != ExpectedSpiritId)
+        log.Add($"Stat IDs diretos: HP={hpId}, Vigor={staminaId}, Espírito={spiritId}");
+        if (hpId != ExpectedHealthId || spiritId != ExpectedSpiritId)
         {
-            diagnostic = string.Join(Environment.NewLine, log.Append(
-                $"Validação direta falhou: esperado HP={ExpectedHealthId} e Espírito={ExpectedSpiritId}. Vigor é apenas diagnóstico."));
+            diagnostic = string.Join(Environment.NewLine, log.Append($"Validação direta falhou: esperado HP={ExpectedHealthId} e Espírito={ExpectedSpiritId}."));
             return false;
         }
 
@@ -451,91 +409,75 @@ public sealed class CrimsonDesertModule : IGameModule, IDisposable
             SpiritCurrent = stats + SpiritCurrentOffset,
             SpiritMax = stats + SpiritMaxOffset
         };
-
         diagnostic = string.Join(Environment.NewLine, log);
         return true;
     }
 
-    private bool InstallCurrentPlayerHook(out string diagnostic)
+    private bool InstallPlayerHook(out string diagnostic)
     {
         diagnostic = string.Empty;
-        if (_memory is null || !_memory.IsAttached)
-            return false;
-
-        if (_hookInstalled)
+        if (_memory is null || !_memory.IsAttached) return false;
+        if (_playerHookInstalled)
         {
-            diagnostic = BuildHookHeader();
+            diagnostic = BuildPlayerHeader();
             return true;
         }
 
-        var log = new List<string>
-        {
-            "Player Capture v0.3.2 - preservado",
-            $"Módulo: 0x{_memory.MainModuleBase.ToInt64():X} / 0x{_memory.MainModuleSize:X} bytes"
-        };
-
+        var log = new List<string> { "Player Capture preservado" };
         try
         {
             nint? match = _memory.FindPatternInMainModule(CheatTableCurrentPlayerAob);
-            if (match.HasValue)
-                _hookSignature = "CT-original-wildcard";
+            if (match.HasValue) _playerSignature = "CT-original-wildcard";
             else
             {
                 match = _memory.FindPatternInMainModule(CurrentPlayerAob);
-                if (match.HasValue)
-                    _hookSignature = "fallback-direct-long";
+                if (match.HasValue) _playerSignature = "fallback-direct-long";
                 else
                 {
                     match = _memory.FindPatternInMainModule(CurrentPlayerShortAob);
-                    if (match.HasValue)
-                        _hookSignature = "fallback-direct-short";
+                    if (match.HasValue) _playerSignature = "fallback-direct-short";
                     else
                     {
                         match = _memory.FindPatternInMainModule(CurrentPlayerLegacyShortAob);
-                        if (match.HasValue)
-                            _hookSignature = "fallback-legacy-short";
+                        if (match.HasValue) _playerSignature = "fallback-legacy-short";
                     }
                 }
             }
 
             if (!match.HasValue)
             {
-                log.Add("AOB getcurrentplayer: não encontrado (não bloqueia o hook direto de stats)");
+                log.Add("AOB getcurrentplayer: não encontrado (não bloqueia stats direto)");
                 diagnostic = string.Join(Environment.NewLine, log);
                 return false;
             }
 
-            _hookAddress = match.Value;
-            _originalHookBytes = _memory.ReadBytes(_hookAddress, HookLength);
-            var expectedPrefixA0 = new byte[] { 0x48, 0x8B, 0x43, 0x68, 0x48, 0x8B, 0x88, 0xA0, 0x01, 0x00, 0x00 };
-            var expectedPrefixB0 = new byte[] { 0x48, 0x8B, 0x43, 0x68, 0x48, 0x8B, 0x88, 0xB0, 0x01, 0x00, 0x00 };
-            if (!_originalHookBytes.SequenceEqual(expectedPrefixA0) && !_originalHookBytes.SequenceEqual(expectedPrefixB0))
+            _playerHookAddress = match.Value;
+            _playerOriginalBytes = _memory.ReadBytes(_playerHookAddress, PlayerHookLength);
+            var a0 = new byte[] { 0x48, 0x8B, 0x43, 0x68, 0x48, 0x8B, 0x88, 0xA0, 0x01, 0x00, 0x00 };
+            var b0 = new byte[] { 0x48, 0x8B, 0x43, 0x68, 0x48, 0x8B, 0x88, 0xB0, 0x01, 0x00, 0x00 };
+            if (!_playerOriginalBytes.SequenceEqual(a0) && !_playerOriginalBytes.SequenceEqual(b0))
             {
-                log.Add($"AOB getcurrentplayer: bytes inesperados: {Convert.ToHexString(_originalHookBytes)}");
+                log.Add("Player hook: bytes inesperados");
                 diagnostic = string.Join(Environment.NewLine, log);
                 return false;
             }
 
-            _codeCave = _memory.AllocateExecutableNear(_hookAddress, CaveSize);
-            _capturePlayerSlot = _codeCave + CapturePlayerSlotOffset;
-            _captureComponentSlot = _codeCave + CaptureComponentSlotOffset;
-            _memory.Write<long>(_capturePlayerSlot, 0);
-            _memory.Write<long>(_captureComponentSlot, 0);
+            _playerCave = _memory.AllocateExecutableNear(_playerHookAddress, PlayerCaveSize);
+            _playerSlot = _playerCave + PlayerSlotOffset;
+            _componentSlot = _playerCave + ComponentSlotOffset;
+            _memory.Write<long>(_playerSlot, 0);
+            _memory.Write<long>(_componentSlot, 0);
+            _memory.WriteBytes(_playerCave, BuildPlayerCaptureCave(_playerCave, _playerSlot, _componentSlot, _playerHookAddress, _playerOriginalBytes));
 
-            var caveCode = BuildCaptureCave(_codeCave, _capturePlayerSlot, _captureComponentSlot, _hookAddress, _originalHookBytes);
-            _memory.WriteBytes(_codeCave, caveCode);
-
-            var patch = new byte[HookLength];
+            var patch = new byte[PlayerHookLength];
             patch[0] = 0xE9;
-            BinaryPrimitives.WriteInt32LittleEndian(patch.AsSpan(1, 4), CheckedRel32(_hookAddress + 5, _codeCave));
-            Array.Fill(patch, (byte)0x90, 5, HookLength - 5);
-            _memory.WriteProtectedBytes(_hookAddress, patch);
-            _hookInstalled = true;
+            BinaryPrimitives.WriteInt32LittleEndian(patch.AsSpan(1, 4), CheckedRel32(_playerHookAddress + 5, _playerCave));
+            Array.Fill(patch, (byte)0x90, 5, PlayerHookLength - 5);
+            _memory.WriteProtectedBytes(_playerHookAddress, patch);
+            _playerHookInstalled = true;
 
-            log.Add($"Assinatura: {_hookSignature}");
-            log.Add($"AOB getcurrentplayer: 0x{_hookAddress.ToInt64():X}");
-            log.Add($"Capture cplayer: 0x{_capturePlayerSlot.ToInt64():X}");
-            log.Add($"Capture csplayer: 0x{_captureComponentSlot.ToInt64():X}");
+            log.Add($"Assinatura: {_playerSignature}");
+            log.Add($"AOB getcurrentplayer: 0x{_playerHookAddress.ToInt64():X}");
             diagnostic = string.Join(Environment.NewLine, log);
             return true;
         }
@@ -543,12 +485,12 @@ public sealed class CrimsonDesertModule : IGameModule, IDisposable
         {
             log.Add($"Falha no player hook preservado: {ex.GetType().Name} - {ex.Message}");
             diagnostic = string.Join(Environment.NewLine, log);
-            SafeRemoveHook();
+            SafeRemovePlayerHook();
             return false;
         }
     }
 
-    private static byte[] BuildCaptureCave(nint cave, nint playerSlot, nint componentSlot, nint hookAddress, byte[] originalBytes)
+    private static byte[] BuildPlayerCaptureCave(nint cave, nint playerSlot, nint componentSlot, nint hook, byte[] originalBytes)
     {
         var code = new List<byte>(80);
         code.AddRange(originalBytes);
@@ -560,51 +502,44 @@ public sealed class CrimsonDesertModule : IGameModule, IDisposable
         code.AddRange(BitConverter.GetBytes(componentSlot.ToInt64()));
         code.AddRange(new byte[] { 0x48, 0x89, 0x02 });
         code.Add(0x5A);
-        var jumpInstruction = cave + code.Count;
+        var jump = cave + code.Count;
         code.Add(0xE9);
-        code.AddRange(BitConverter.GetBytes(CheckedRel32(jumpInstruction + 5, hookAddress + HookLength)));
+        code.AddRange(BitConverter.GetBytes(CheckedRel32(jump + 5, hook + PlayerHookLength)));
         return code.ToArray();
     }
 
-    private bool TryReadCapturedPointers(out nint capturedPlayer, out nint capturedComponent)
+    private bool TryReadCapturedPlayer(out nint player, out nint component)
     {
-        capturedPlayer = 0;
-        capturedComponent = 0;
-        if (_memory is null || !_memory.IsAttached || !_hookInstalled || _capturePlayerSlot == 0 || _captureComponentSlot == 0)
-            return false;
+        player = 0;
+        component = 0;
+        if (_memory is null || !_memory.IsAttached || !_playerHookInstalled || _playerSlot == 0 || _componentSlot == 0) return false;
+        if (!_memory.TryRead<long>(_playerSlot, out var rawPlayer) || !_memory.TryRead<long>(_componentSlot, out var rawComponent)) return false;
+        player = (nint)rawPlayer;
+        component = (nint)rawComponent;
+        return (player == 0 || ProcessMemory.IsLikelyPointer(player)) && (component == 0 || ProcessMemory.IsLikelyPointer(component));
+    }
 
-        if (!_memory.TryRead<long>(_capturePlayerSlot, out var rawPlayer)
-            || !_memory.TryRead<long>(_captureComponentSlot, out var rawComponent))
-            return false;
-
-        capturedPlayer = (nint)rawPlayer;
-        capturedComponent = (nint)rawComponent;
-        return (capturedPlayer == 0 || ProcessMemory.IsLikelyPointer(capturedPlayer))
-               && (capturedComponent == 0 || ProcessMemory.IsLikelyPointer(capturedComponent));
+    private void FillCapturedPlayer(RuntimeState runtime)
+    {
+        if (TryReadCapturedPlayer(out var player, out var component))
+        {
+            runtime.CapturedPlayer = player;
+            runtime.PlayerComponent = component;
+        }
     }
 
     private bool EnsureRuntime()
     {
-        if (_runtime.IsResolved && ValidateRuntime())
-            return true;
-
-        if (TryReadCapturedStats(out var stats)
-            && stats != 0
-            && TryResolveDirectStats(stats, out var runtime, out var diagnostic))
+        if (_runtime.IsResolved && ValidateRuntime()) return true;
+        if (TryReadCapturedStats(out var stats) && stats != 0 && TryResolveDirectStats(stats, out var runtime, out var diagnostic))
         {
-            if (TryReadCapturedPointers(out var player, out var component))
-            {
-                runtime.CapturedPlayer = player;
-                runtime.PlayerComponent = component;
-            }
-
+            FillCapturedPlayer(runtime);
             _runtime = runtime;
             DiagnosticReport = BuildCombinedHeader() + Environment.NewLine + diagnostic;
             RuntimeStatus = "Pronto • stats do jogador capturados diretamente pela rotina CT";
             LastError = string.Empty;
             return true;
         }
-
         RuntimeStatus = "Aguardando a rotina de stats capturar o jogador...";
         LastError = RuntimeStatus;
         return false;
@@ -612,32 +547,20 @@ public sealed class CrimsonDesertModule : IGameModule, IDisposable
 
     private bool ValidateRuntime()
     {
-        if (!_runtime.IsResolved || _memory is null)
-            return false;
-
+        if (!_runtime.IsResolved || _memory is null) return false;
         if (!_memory.TryRead<int>(_runtime.StatsBase + HealthIdOffset, out var hpId)
-            || !_memory.TryRead<int>(_runtime.StatsBase + SpiritIdOffset, out var spiritId))
-            return false;
-
-        if (hpId != ExpectedHealthId || spiritId != ExpectedSpiritId)
-            return false;
-
+            || !_memory.TryRead<int>(_runtime.StatsBase + SpiritIdOffset, out var spiritId)) return false;
+        if (hpId != ExpectedHealthId || spiritId != ExpectedSpiritId) return false;
         return TryReadStatPair(_runtime.HealthCurrent, _runtime.HealthMax, out _)
-               && TryReadStatPair(_runtime.StaminaCurrent, _runtime.StaminaMax, out _)
-               && TryReadStatPair(_runtime.SpiritCurrent, _runtime.SpiritMax, out _);
+            && TryReadStatPair(_runtime.StaminaCurrent, _runtime.StaminaMax, out _)
+            && TryReadStatPair(_runtime.SpiritCurrent, _runtime.SpiritMax, out _);
     }
 
     private bool TryReadStatPair(nint currentAddress, nint maxAddress, out StatPair stat)
     {
         stat = default;
-        if (_memory is null
-            || !_memory.TryRead<uint>(currentAddress, out var current)
-            || !_memory.TryRead<uint>(maxAddress, out var maximum))
-            return false;
-
-        if (maximum == 0 || maximum > 1_000_000_000U || (ulong)current > (ulong)maximum * 20UL)
-            return false;
-
+        if (_memory is null || !_memory.TryRead<uint>(currentAddress, out var current) || !_memory.TryRead<uint>(maxAddress, out var maximum)) return false;
+        if (maximum == 0 || maximum > 1_000_000_000U || (ulong)current > (ulong)maximum * 20UL) return false;
         stat = new StatPair(current, maximum);
         return true;
     }
@@ -650,38 +573,27 @@ public sealed class CrimsonDesertModule : IGameModule, IDisposable
             RuntimeStatus = $"{label}: estrutura mudou; aguardando recaptura automática...";
             return;
         }
-
-        if (stat.Current != stat.Maximum)
-            _memory!.Write(currentAddress, stat.Maximum);
+        if (stat.Current != stat.Maximum) _memory!.Write(currentAddress, stat.Maximum);
     }
 
-    private string BuildCombinedHeader()
-        => BuildHookHeader() + Environment.NewLine + BuildStatHookHeader();
+    private string BuildCombinedHeader() => BuildPlayerHeader() + Environment.NewLine + BuildStatHeader();
 
-    private string BuildHookHeader()
+    private string BuildPlayerHeader() => string.Join(Environment.NewLine,
+        "Player Capture preservado",
+        $"Assinatura: {_playerSignature}",
+        $"AOB getcurrentplayer: {(_playerHookAddress == 0 ? "não resolvido" : $"0x{_playerHookAddress.ToInt64():X}")}",
+        $"Capture cplayer: {(_playerSlot == 0 ? "não alocado" : $"0x{_playerSlot.ToInt64():X}")}",
+        $"Capture csplayer: {(_componentSlot == 0 ? "não alocado" : $"0x{_componentSlot.ToInt64():X}")}");
+
+    private string BuildStatHeader()
     {
-        if (_memory is null)
-            return "Player hook indisponível.";
-
-        return string.Join(Environment.NewLine,
-            "Player Capture preservado",
-            $"Assinatura: {_hookSignature}",
-            $"AOB getcurrentplayer: {(_hookAddress == 0 ? "não resolvido" : $"0x{_hookAddress.ToInt64():X}")}",
-            $"Capture cplayer: {(_capturePlayerSlot == 0 ? "não alocado" : $"0x{_capturePlayerSlot.ToInt64():X}")}",
-            $"Capture csplayer: {(_captureComponentSlot == 0 ? "não alocado" : $"0x{_captureComponentSlot.ToInt64():X}")}");
-    }
-
-    private string BuildStatHookHeader()
-    {
-        if (_memory is null)
-            return "Stat hook indisponível.";
-
+        if (_memory is null) return "Stat hook indisponível.";
         return string.Join(Environment.NewLine,
             "Diagnóstico v0.3.3 - CT Direct Stat Capture",
             $"Módulo: 0x{_memory.MainModuleBase.ToInt64():X} / 0x{_memory.MainModuleSize:X} bytes",
             $"AOB StaminaInj: {(_statHookAddress == 0 ? "não resolvido" : $"0x{_statHookAddress.ToInt64():X}")}",
-            $"Stat cave: {(_statCodeCave == 0 ? "não alocado" : $"0x{_statCodeCave.ToInt64():X}")}",
-            $"Capture Stats/RDI: {(_statCaptureSlot == 0 ? "não alocado" : $"0x{_statCaptureSlot.ToInt64():X}")}",
+            $"Stat cave: {(_statCave == 0 ? "não alocado" : $"0x{_statCave.ToInt64():X}")}",
+            $"Capture Stats/RDI: {(_statSlot == 0 ? "não alocado" : $"0x{_statSlot.ToInt64():X}")}",
             "Filtro: [RDI+5A0] == 19",
             "Offsets: HP 08/18 | Vigor 518/528 | Espírito 5A8/5B8");
     }
@@ -689,20 +601,17 @@ public sealed class CrimsonDesertModule : IGameModule, IDisposable
     private static int CheckedRel32(nint instructionEnd, nint target)
     {
         var delta = target.ToInt64() - instructionEnd.ToInt64();
-        if (delta < int.MinValue || delta > int.MaxValue)
-            throw new InvalidOperationException("O salto relativo ficou fora do alcance de 32 bits.");
+        if (delta < int.MinValue || delta > int.MaxValue) throw new InvalidOperationException("O salto relativo ficou fora do alcance de 32 bits.");
         return (int)delta;
     }
 
     public void Detach()
     {
         SafeRemoveStatHook();
-        SafeRemoveHook();
+        SafeRemovePlayerHook();
         _memory = null;
         _runtime = new RuntimeState();
-        _health = false;
-        _stamina = false;
-        _spirit = false;
+        _health = _stamina = _spirit = false;
         RuntimeStatus = "Aguardando o jogo";
     }
 
@@ -712,70 +621,41 @@ public sealed class CrimsonDesertModule : IGameModule, IDisposable
         {
             try
             {
-                if (_statHookInstalled && _statHookAddress != 0 && _statOriginalHookBytes is { Length: StatHookLength })
+                if (_statHookInstalled && _statHookAddress != 0 && _statOriginalBytes is { Length: StatHookLength }
+                    && _memory.TryReadBytes(_statHookAddress, 5, out var current) && current[0] == 0xE9)
                 {
-                    if (_memory.TryReadBytes(_statHookAddress, 5, out var current)
-                        && current.Length == 5 && current[0] == 0xE9)
-                    {
-                        var rel = BinaryPrimitives.ReadInt32LittleEndian(current.AsSpan(1, 4));
-                        var destination = _statHookAddress.ToInt64() + 5L + rel;
-                        if (destination == _statCodeCave.ToInt64())
-                            _memory.WriteProtectedBytes(_statHookAddress, _statOriginalHookBytes);
-                    }
+                    var rel = BinaryPrimitives.ReadInt32LittleEndian(current.AsSpan(1, 4));
+                    if (_statHookAddress.ToInt64() + 5L + rel == _statCave.ToInt64()) _memory.WriteProtectedBytes(_statHookAddress, _statOriginalBytes);
                 }
             }
             catch { }
-
-            try
-            {
-                if (_statCodeCave != 0)
-                    _memory.FreeRemote(_statCodeCave);
-            }
-            catch { }
+            try { if (_statCave != 0) _memory.FreeRemote(_statCave); } catch { }
         }
-
         _statHookInstalled = false;
-        _statHookAddress = 0;
-        _statCodeCave = 0;
-        _statCaptureSlot = 0;
-        _statOriginalHookBytes = null;
+        _statHookAddress = _statCave = _statSlot = 0;
+        _statOriginalBytes = null;
     }
 
-    private void SafeRemoveHook()
+    private void SafeRemovePlayerHook()
     {
         if (_memory is not null && _memory.IsAttached)
         {
             try
             {
-                if (_hookInstalled && _hookAddress != 0 && _originalHookBytes is { Length: HookLength })
+                if (_playerHookInstalled && _playerHookAddress != 0 && _playerOriginalBytes is { Length: PlayerHookLength }
+                    && _memory.TryReadBytes(_playerHookAddress, 5, out var current) && current[0] == 0xE9)
                 {
-                    if (_memory.TryReadBytes(_hookAddress, 5, out var current)
-                        && current.Length == 5 && current[0] == 0xE9)
-                    {
-                        var rel = BinaryPrimitives.ReadInt32LittleEndian(current.AsSpan(1, 4));
-                        var destination = _hookAddress.ToInt64() + 5L + rel;
-                        if (destination == _codeCave.ToInt64())
-                            _memory.WriteProtectedBytes(_hookAddress, _originalHookBytes);
-                    }
+                    var rel = BinaryPrimitives.ReadInt32LittleEndian(current.AsSpan(1, 4));
+                    if (_playerHookAddress.ToInt64() + 5L + rel == _playerCave.ToInt64()) _memory.WriteProtectedBytes(_playerHookAddress, _playerOriginalBytes);
                 }
             }
             catch { }
-
-            try
-            {
-                if (_codeCave != 0)
-                    _memory.FreeRemote(_codeCave);
-            }
-            catch { }
+            try { if (_playerCave != 0) _memory.FreeRemote(_playerCave); } catch { }
         }
-
-        _hookInstalled = false;
-        _hookAddress = 0;
-        _codeCave = 0;
-        _capturePlayerSlot = 0;
-        _captureComponentSlot = 0;
-        _originalHookBytes = null;
-        _hookSignature = "não resolvida";
+        _playerHookInstalled = false;
+        _playerHookAddress = _playerCave = _playerSlot = _componentSlot = 0;
+        _playerOriginalBytes = null;
+        _playerSignature = "não resolvida";
     }
 
     public void Dispose() => Detach();
