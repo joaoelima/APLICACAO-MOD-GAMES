@@ -26,8 +26,8 @@ jobs:
       - name: Compilar
         run: dotnet build GameTrainer.sln --configuration Release --no-restore
 
-      - name: Publicar aplicativo
-        run: dotnet publish src/GameTrainer.App/GameTrainer.App.csproj --configuration Release --runtime win-x64 --self-contained false --output publish
+      - name: Publicar aplicativo autocontido
+        run: dotnet publish src/GameTrainer.App/GameTrainer.App.csproj --configuration Release --runtime win-x64 --self-contained true -p:PublishSingleFile=true -p:IncludeNativeLibrariesForSelfExtract=true --output publish
 
       - name: Disponibilizar artefato
         uses: actions/upload-artifact@v4
