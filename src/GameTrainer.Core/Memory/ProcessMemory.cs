@@ -138,6 +138,50 @@ public sealed class ProcessMemory : IDisposable
         return result;
     }
 
+    public nint AllocateExecutableNear(nint target, int size, long maxDistance = 0x70000000)
+    {
+        EnsureAttached();
+
+        const long granularity = 0x10000;
+        var targetValue = target.ToInt64();
+        var aligned = targetValue & ~(granularity - 1);
+
+        for (long distance = granularity; distance <= maxDistance; distance += granularity)
+        {
+            var high = aligned + distance;
+            if (high > 0 && high <= 0x00007FFFFFFFFFFF)
+            {
+                var allocated = NativeMethods.VirtualAllocEx(
+                    _handle,
+                    (nint)high,
+                    (UIntPtr)size,
+                    NativeMethods.AllocationType.Commit | NativeMethods.AllocationType.Reserve,
+                    NativeMethods.MemoryProtection.ExecuteReadWrite);
+                if (allocated != IntPtr.Zero && Math.Abs(allocated.ToInt64() - targetValue) <= int.MaxValue)
+                    return allocated;
+                if (allocated != IntPtr.Zero)
+                    NativeMethods.VirtualFreeEx(_handle, allocated, UIntPtr.Zero, NativeMethods.FreeType.Release);
+            }
+
+            var low = aligned - distance;
+            if (low >= 0x10000)
+            {
+                var allocated = NativeMethods.VirtualAllocEx(
+                    _handle,
+                    (nint)low,
+                    (UIntPtr)size,
+                    NativeMethods.AllocationType.Commit | NativeMethods.AllocationType.Reserve,
+                    NativeMethods.MemoryProtection.ExecuteReadWrite);
+                if (allocated != IntPtr.Zero && Math.Abs(allocated.ToInt64() - targetValue) <= int.MaxValue)
+                    return allocated;
+                if (allocated != IntPtr.Zero)
+                    NativeMethods.VirtualFreeEx(_handle, allocated, UIntPtr.Zero, NativeMethods.FreeType.Release);
+            }
+        }
+
+        throw new InvalidOperationException("Não foi possível reservar memória executável próxima ao ponto de hook.");
+    }
+
     public void FreeRemote(nint address)
     {
         if (!IsAttached || address == 0) return;
