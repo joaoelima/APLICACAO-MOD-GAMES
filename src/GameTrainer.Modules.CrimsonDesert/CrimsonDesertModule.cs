@@ -20,28 +20,27 @@ public sealed class CrimsonDesertModule : IGameModule
                 Name = "Jogador",
                 Features = new TrainerFeature[]
                 {
-                    new() { Id = "infinite-health", Name = "Vida ilimitada", Type = TrainerFeatureType.Toggle },
-                    new() { Id = "infinite-stamina", Name = "Vigor ilimitado", Type = TrainerFeatureType.Toggle },
-                    new() { Id = "infinite-spirit", Name = "Espírito ilimitado", Type = TrainerFeatureType.Toggle },
-                    new() { Id = "defense", Name = "Editar Defesa", Type = TrainerFeatureType.Number, Min = 0, Max = 999999, Step = 1 }
-                }
-            },
-            new TrainerSection
-            {
-                Name = "Inventário",
-                Features = new TrainerFeature[]
-                {
-                    new() { Id = "selected-item-quantity", Name = "Editar item selecionado / quantidade em dinheiro", Type = TrainerFeatureType.Number, Min = 0, Max = 999999999, Step = 1 }
-                }
-            },
-            new TrainerSection
-            {
-                Name = "Estatísticas",
-                Features = new TrainerFeature[]
-                {
-                    new() { Id = "max-health", Name = "Editar Saúde Máxima", Type = TrainerFeatureType.Number, Min = 1, Max = 999999, Step = 1 },
-                    new() { Id = "max-stamina", Name = "Editar Stamina Máxima", Type = TrainerFeatureType.Number, Min = 1, Max = 999999, Step = 1 },
-                    new() { Id = "max-spirit", Name = "Editar Espírito Máximo", Type = TrainerFeatureType.Number, Min = 1, Max = 999999, Step = 1 }
+                    new()
+                    {
+                        Id = "infinite-health",
+                        Name = "Vida ilimitada",
+                        Description = "Mantém a vida do personagem sem redução durante o combate.",
+                        Type = TrainerFeatureType.Toggle
+                    },
+                    new()
+                    {
+                        Id = "infinite-stamina",
+                        Name = "Vigor ilimitado",
+                        Description = "Impede o consumo de vigor durante ações do personagem.",
+                        Type = TrainerFeatureType.Toggle
+                    },
+                    new()
+                    {
+                        Id = "infinite-spirit",
+                        Name = "Espírito ilimitado",
+                        Description = "Mantém o recurso de espírito disponível continuamente.",
+                        Type = TrainerFeatureType.Toggle
+                    }
                 }
             },
             new TrainerSection
@@ -49,16 +48,13 @@ public sealed class CrimsonDesertModule : IGameModule
                 Name = "Inimigos",
                 Features = new TrainerFeature[]
                 {
-                    new() { Id = "one-hit-kill", Name = "Super Dano / Mortes com Um Golpe", Type = TrainerFeatureType.Toggle }
-                }
-            },
-            new TrainerSection
-            {
-                Name = "Jogo",
-                Features = new TrainerFeature[]
-                {
-                    new() { Id = "freeze-day", Name = "Congelar Dia", Type = TrainerFeatureType.Toggle },
-                    new() { Id = "advance-hour", Name = "Avançar 1 Hora", Type = TrainerFeatureType.Action }
+                    new()
+                    {
+                        Id = "one-hit-kill",
+                        Name = "Super Dano / Mortes com Um Golpe",
+                        Description = "Aumenta o dano aplicado para derrotar inimigos com um único golpe.",
+                        Type = TrainerFeatureType.Toggle
+                    }
                 }
             }
         }
@@ -72,8 +68,9 @@ public sealed class CrimsonDesertModule : IGameModule
 
     public Task<bool> SetToggleAsync(string featureId, bool enabled, CancellationToken cancellationToken = default)
     {
-        // Os endereços/assinaturas do Crimson Desert serão adicionados depois da validação
-        // da versão real do jogo. O módulo já está pronto para receber esses patches.
+        // As assinaturas/offsets do Crimson Desert serão adicionados após a validação
+        // da versão real do jogo. O escopo inicial possui quatro modificações:
+        // vida ilimitada, vigor ilimitado, espírito ilimitado e morte com um golpe.
         return Task.FromResult(false);
     }
 
