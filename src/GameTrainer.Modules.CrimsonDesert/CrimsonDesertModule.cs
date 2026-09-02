@@ -28,21 +28,17 @@ public sealed class CrimsonDesertModule : IGameModule, IDisposable
     private const int ExpectedStaminaId = 17;
     private const int ExpectedSpiritId = 19;
 
-    // Contexto observado na build 1.0.0.2692. O hook real começa 15 bytes após o início.
-    private const string CurrentPlayerContextAob =
-        "48 8B 53 08 48 8D 4C 24 78 E8 ? ? ? ? 90 48 8B 43 68 48 8B 88 A0 01 00 00";
-    private const int CurrentPlayerContextHookOffset = 15;
+    // Tradução byte-a-byte da AOB original da CrimsonDesert.CT:
+    // 48xxxxxx48xxxxxxxxxxxx48xxxxxx0FB7xxxx66xxxxxxxxB8xxxxxxxx66xxxx74xx
+    // 48xxxxxxxxE8xxxxxxxx0FB7xx48xxxxxxxx48xxxxB2xxFFxxxx0FB7xx48xxxxxxxxE8xxxxxxxx3A
+    private const string CheatTableCurrentPlayerAob =
+        "48 ? ? ? 48 ? ? ? ? ? ? 48 ? ? ? 0F B7 ? ? 66 ? ? ? ? B8 ? ? ? ? 66 ? ? 74 ? 48 ? ? ? ? E8 ? ? ? ? 0F B7 ? 48 ? ? ? ? 48 ? ? B2 ? FF ? ? 0F B7 ? 48 ? ? ? ? E8 ? ? ? ? 3A";
 
-    // Assinatura direta da região descrita pela Cheat Table atual.
+    // Fallbacks antigos ficam preservados. Só são usados se a AOB original da CT não resolver.
     private const string CurrentPlayerAob =
         "48 8B 43 68 48 8B 88 A0 01 00 00 48 8B 41 38 0F B7 48 20";
-
-    private const string CurrentPlayerLegacyContextAob =
-        "48 8B 53 08 48 8D 4C 24 78 E8 ? ? ? ? 90 48 8B 43 68 48 8B 88 B0 01 00 00";
-
     private const string CurrentPlayerShortAob =
         "48 8B 43 68 48 8B 88 A0 01 00 00";
-
     private const string CurrentPlayerLegacyShortAob =
         "48 8B 43 68 48 8B 88 B0 01 00 00";
 
@@ -273,7 +269,7 @@ public sealed class CrimsonDesertModule : IGameModule, IDisposable
 
         var log = new List<string>
         {
-            "Diagnóstico v0.3.1 - CT Context Player Capture",
+            "Diagnóstico v0.3.2 - CT Original AOB Player Capture",
             $"Módulo: 0x{_memory.MainModuleBase.ToInt64():X} / 0x{_memory.MainModuleSize:X} bytes",
             "Fonte estrutural: CrimsonDesert.CT",
             "Cadeia: cplayer -> [cplayer+68]/csplayer -> +20 -> +18 -> +58 -> Stats",
@@ -282,37 +278,26 @@ public sealed class CrimsonDesertModule : IGameModule, IDisposable
 
         try
         {
-            nint? match;
-            var context = _memory.FindPatternInMainModule(CurrentPlayerContextAob);
-            if (context.HasValue)
+            nint? match = _memory.FindPatternInMainModule(CheatTableCurrentPlayerAob);
+            if (match.HasValue)
             {
-                match = context.Value + CurrentPlayerContextHookOffset;
-                _hookSignature = "context-2692 +15";
+                _hookSignature = "CT-original-wildcard";
             }
             else
             {
-                var legacyContext = _memory.FindPatternInMainModule(CurrentPlayerLegacyContextAob);
-                if (legacyContext.HasValue)
-                {
-                    match = legacyContext.Value + CurrentPlayerContextHookOffset;
-                    _hookSignature = "context-legacy +15";
-                }
+                match = _memory.FindPatternInMainModule(CurrentPlayerAob);
+                if (match.HasValue)
+                    _hookSignature = "fallback-direct-long";
                 else
                 {
-                    match = _memory.FindPatternInMainModule(CurrentPlayerAob);
+                    match = _memory.FindPatternInMainModule(CurrentPlayerShortAob);
                     if (match.HasValue)
-                        _hookSignature = "direct-long";
+                        _hookSignature = "fallback-direct-short";
                     else
                     {
-                        match = _memory.FindPatternInMainModule(CurrentPlayerShortAob);
+                        match = _memory.FindPatternInMainModule(CurrentPlayerLegacyShortAob);
                         if (match.HasValue)
-                            _hookSignature = "direct-short";
-                        else
-                        {
-                            match = _memory.FindPatternInMainModule(CurrentPlayerLegacyShortAob);
-                            if (match.HasValue)
-                                _hookSignature = "legacy-short";
-                        }
+                            _hookSignature = "fallback-legacy-short";
                     }
                 }
             }
@@ -386,21 +371,16 @@ public sealed class CrimsonDesertModule : IGameModule, IDisposable
         byte[] originalBytes)
     {
         var code = new List<byte>(80);
-
-        // Primeiro reproduz exatamente o código do jogo:
-        // mov rax,[rbx+68]
-        // mov rcx,[rax+1A0/1B0]
         code.AddRange(originalBytes);
 
-        // Preserva RDX e flags, e guarda RBX (cplayer) + RAX (csplayer/component).
-        code.Add(0x52);                         // push rdx
-        code.AddRange(new byte[] { 0x48, 0xBA }); // mov rdx, imm64
+        code.Add(0x52);
+        code.AddRange(new byte[] { 0x48, 0xBA });
         code.AddRange(BitConverter.GetBytes(playerSlot.ToInt64()));
-        code.AddRange(new byte[] { 0x48, 0x89, 0x1A }); // mov [rdx],rbx
-        code.AddRange(new byte[] { 0x48, 0xBA }); // mov rdx, imm64
+        code.AddRange(new byte[] { 0x48, 0x89, 0x1A });
+        code.AddRange(new byte[] { 0x48, 0xBA });
         code.AddRange(BitConverter.GetBytes(componentSlot.ToInt64()));
-        code.AddRange(new byte[] { 0x48, 0x89, 0x02 }); // mov [rdx],rax
-        code.Add(0x5A);                         // pop rdx
+        code.AddRange(new byte[] { 0x48, 0x89, 0x02 });
+        code.Add(0x5A);
 
         var jumpInstruction = cave + code.Count;
         code.Add(0xE9);
@@ -610,7 +590,7 @@ public sealed class CrimsonDesertModule : IGameModule, IDisposable
             return "Hook indisponível.";
 
         return string.Join(Environment.NewLine,
-            "Diagnóstico v0.3.1 - CT Context Player Capture",
+            "Diagnóstico v0.3.2 - CT Original AOB Player Capture",
             $"Módulo: 0x{_memory.MainModuleBase.ToInt64():X} / 0x{_memory.MainModuleSize:X} bytes",
             $"Assinatura: {_hookSignature}",
             $"AOB getcurrentplayer: {(_hookAddress == 0 ? "não resolvido" : $"0x{_hookAddress.ToInt64():X}")}",
