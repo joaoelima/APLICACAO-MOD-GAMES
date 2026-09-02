@@ -195,8 +195,17 @@ public sealed class CrimsonDesertModule : IGameModule
 
     private void ApplySuperDamage()
     {
-        if (_memory is null || !_runtime.IsResolved || _runtime.AttackAddress == 0)
+        if (_memory is null || !_runtime.IsResolved)
             return;
+
+        if (_runtime.AttackAddress == 0)
+        {
+            if (!TryResolveAttack(out var resolvedAddress, out var resolvedAttack))
+                return;
+
+            _runtime.AttackAddress = resolvedAddress;
+            _originalAttack ??= resolvedAttack;
+        }
 
         if (!_memory.TryRead<int>(_runtime.AttackAddress, out var currentAttack) || currentAttack <= 0 || currentAttack > 50_000_000)
         {
@@ -332,7 +341,7 @@ public sealed class CrimsonDesertModule : IGameModule
         runtime.IsResolved = true;
 
         // O componente de combate é validado separadamente, pois pode mudar entre versões.
-        if (TryResolveAttack(out var attackAddress, out _ , root))
+        if (TryResolveAttack(out var attackAddress, out _, root))
             runtime.AttackAddress = attackAddress;
 
         return true;
