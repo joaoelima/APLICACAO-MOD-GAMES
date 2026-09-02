@@ -32,7 +32,6 @@ public partial class MainWindow : Window
         _processTimer.Tick += async (_, _) => await RefreshGameStateAsync();
         _processTimer.Start();
 
-        // Escritas pequenas e periódicas, somente enquanto algum recurso estiver ativo.
         _trainerTimer = new System.Windows.Threading.DispatcherTimer
         {
             Interval = TimeSpan.FromMilliseconds(50)
@@ -107,6 +106,54 @@ public partial class MainWindow : Window
         finally
         {
             _trainerTickRunning = false;
+        }
+    }
+
+    private async void Reprobe_Click(object sender, RoutedEventArgs e)
+    {
+        if (!_memory.IsAttached)
+        {
+            TrainerStatusText.Text = "O Crimson Desert ainda não está conectado.";
+            return;
+        }
+
+        TrainerStatusText.Text = "Reanalisando memória do jogo...";
+        try
+        {
+            var ok = await _module.ReprobeAsync();
+            TrainerStatusText.Text = _module.RuntimeStatus;
+            if (!ok)
+                StatusBadge.Text = "DIAGNÓSTICO";
+            else
+                StatusBadge.Text = "CONECTADO";
+        }
+        catch (Exception ex)
+        {
+            TrainerStatusText.Text = $"Falha ao reanalisar: {ex.Message}";
+            StatusBadge.Text = "ERRO";
+        }
+    }
+
+    private void CopyDiagnostic_Click(object sender, RoutedEventArgs e)
+    {
+        var version = _memory.Process is null ? null : TryGetVersion(_memory.Process);
+        var processInfo = _memory.Process is null
+            ? "Processo: não conectado"
+            : $"Processo: {_memory.Process.ProcessName}.exe | PID {_memory.Process.Id} | versão {version ?? "desconhecida"}";
+
+        var report = $"Game Trainer v0.2.1{Environment.NewLine}" +
+                     $"{processInfo}{Environment.NewLine}" +
+                     $"Status: {_module.RuntimeStatus}{Environment.NewLine}{Environment.NewLine}" +
+                     _module.DiagnosticReport;
+
+        try
+        {
+            Clipboard.SetText(report);
+            TrainerStatusText.Text = "Diagnóstico copiado. Cole essa informação na conversa comigo.";
+        }
+        catch (Exception ex)
+        {
+            TrainerStatusText.Text = $"Não foi possível copiar o diagnóstico: {ex.Message}";
         }
     }
 
@@ -200,7 +247,6 @@ public partial class MainWindow : Window
         }
         catch
         {
-            // Encerramento do aplicativo: não há ação adicional necessária.
         }
 
         _memory.Dispose();
