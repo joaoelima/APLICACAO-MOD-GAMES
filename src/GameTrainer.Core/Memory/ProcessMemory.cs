@@ -4,6 +4,8 @@ using System.Runtime.InteropServices;
 
 namespace GameTrainer.Core.Memory;
 
+public readonly record struct MemoryRegionInfo(nint BaseAddress, long Size, uint Type, bool IsWritable);
+
 public sealed class ProcessMemory : IDisposable
 {
     private IntPtr _handle;
@@ -102,6 +104,44 @@ public sealed class ProcessMemory : IDisposable
         var buffer = new byte[Marshal.SizeOf<T>()];
         MemoryMarshal.Write(buffer.AsSpan(), in value);
         WriteBytes(address, buffer);
+    }
+
+    public IReadOnlyList<MemoryRegionInfo> GetReadableRegions(bool writableOnly = false)
+    {
+        EnsureAttached();
+
+        const long minimumAddress = 0x10000;
+        const long maximumUserAddress = 0x00007FFFFFFF0000;
+        var regions = new List<MemoryRegionInfo>();
+        var cursor = minimumAddress;
+        var mbiSize = (UIntPtr)Marshal.SizeOf<NativeMethods.MemoryBasicInformation>();
+
+        while (cursor < maximumUserAddress && IsAttached)
+        {
+            if (NativeMethods.VirtualQueryEx(_handle, (nint)cursor, out var info, mbiSize) == UIntPtr.Zero)
+            {
+                cursor += 0x1000;
+                continue;
+            }
+
+            var regionStart = info.BaseAddress.ToInt64();
+            var regionSize = (long)info.RegionSize.ToUInt64();
+            if (regionSize <= 0)
+            {
+                cursor += 0x1000;
+                continue;
+            }
+
+            var regionEnd = regionStart + regionSize;
+            var writable = IsWritableRegion(info);
+
+            if (IsReadableRegion(info) && (!writableOnly || writable))
+                regions.Add(new MemoryRegionInfo((nint)regionStart, regionSize, info.Type, writable));
+
+            cursor = regionEnd > cursor ? regionEnd : cursor + 0x1000;
+        }
+
+        return regions;
     }
 
     public nint? FindPatternInMainModule(string signature, int chunkSize = 1024 * 1024)
@@ -204,6 +244,15 @@ public sealed class ProcessMemory : IDisposable
                        NativeMethods.MemoryProtection.ExecuteWriteCopy;
 
         return (info.Protect & readable) != 0;
+    }
+
+    private static bool IsWritableRegion(NativeMethods.MemoryBasicInformation info)
+    {
+        var writable = NativeMethods.MemoryProtection.ReadWrite |
+                       NativeMethods.MemoryProtection.WriteCopy |
+                       NativeMethods.MemoryProtection.ExecuteReadWrite |
+                       NativeMethods.MemoryProtection.ExecuteWriteCopy;
+        return (info.Protect & writable) != 0;
     }
 
     public void Detach()
