@@ -141,45 +141,93 @@ public sealed class ProcessMemory : IDisposable
     public nint AllocateExecutableNear(nint target, int size, long maxDistance = 0x70000000)
     {
         EnsureAttached();
+        if (size <= 0)
+            throw new ArgumentOutOfRangeException(nameof(size));
 
         const long granularity = 0x10000;
+        const long minimumAddress = 0x10000;
+        const long maximumUserAddress = 0x00007FFFFFFF0000;
+
+        static long AlignUp(long value, long alignment)
+            => (value + alignment - 1) & ~(alignment - 1);
+
+        static long AlignDown(long value, long alignment)
+            => value & ~(alignment - 1);
+
         var targetValue = target.ToInt64();
-        var aligned = targetValue & ~(granularity - 1);
+        var lowerBound = Math.Max(minimumAddress, targetValue - maxDistance);
+        var upperBound = Math.Min(maximumUserAddress, targetValue + maxDistance);
+        var cursor = Math.Max(minimumAddress, AlignDown(lowerBound, granularity));
+        var mbiSize = (UIntPtr)Marshal.SizeOf<NativeMethods.MemoryBasicInformation>();
+        var candidates = new HashSet<long>();
 
-        for (long distance = granularity; distance <= maxDistance; distance += granularity)
+        while (cursor < upperBound && IsAttached)
         {
-            var high = aligned + distance;
-            if (high > 0 && high <= 0x00007FFFFFFFFFFF)
-            {
-                var allocated = NativeMethods.VirtualAllocEx(
+            if (NativeMethods.VirtualQueryEx(
                     _handle,
-                    (nint)high,
-                    (UIntPtr)size,
-                    NativeMethods.AllocationType.Commit | NativeMethods.AllocationType.Reserve,
-                    NativeMethods.MemoryProtection.ExecuteReadWrite);
-                if (allocated != IntPtr.Zero && Math.Abs(allocated.ToInt64() - targetValue) <= int.MaxValue)
-                    return allocated;
-                if (allocated != IntPtr.Zero)
-                    NativeMethods.VirtualFreeEx(_handle, allocated, UIntPtr.Zero, NativeMethods.FreeType.Release);
+                    (nint)cursor,
+                    out var info,
+                    mbiSize) == UIntPtr.Zero)
+            {
+                cursor += granularity;
+                continue;
             }
 
-            var low = aligned - distance;
-            if (low >= 0x10000)
+            var regionStart = info.BaseAddress.ToInt64();
+            var regionSize = (long)info.RegionSize.ToUInt64();
+            if (regionSize <= 0)
             {
-                var allocated = NativeMethods.VirtualAllocEx(
-                    _handle,
-                    (nint)low,
-                    (UIntPtr)size,
-                    NativeMethods.AllocationType.Commit | NativeMethods.AllocationType.Reserve,
-                    NativeMethods.MemoryProtection.ExecuteReadWrite);
-                if (allocated != IntPtr.Zero && Math.Abs(allocated.ToInt64() - targetValue) <= int.MaxValue)
-                    return allocated;
-                if (allocated != IntPtr.Zero)
-                    NativeMethods.VirtualFreeEx(_handle, allocated, UIntPtr.Zero, NativeMethods.FreeType.Release);
+                cursor += granularity;
+                continue;
             }
+
+            var regionEnd = regionStart + regionSize;
+            if (info.State == NativeMethods.MemoryState.Free && regionSize >= size)
+            {
+                var usableStart = Math.Max(regionStart, lowerBound);
+                var usableEnd = Math.Min(regionEnd - size, upperBound - size);
+
+                if (usableStart <= usableEnd)
+                {
+                    var first = AlignUp(usableStart, granularity);
+                    var last = AlignDown(usableEnd, granularity);
+
+                    if (first <= usableEnd)
+                        candidates.Add(first);
+                    if (last >= usableStart)
+                        candidates.Add(last);
+
+                    var nearTarget = AlignDown(targetValue, granularity);
+                    nearTarget = Math.Clamp(nearTarget, first, last);
+                    if (nearTarget >= usableStart && nearTarget <= usableEnd)
+                        candidates.Add(nearTarget);
+                }
+            }
+
+            cursor = regionEnd > cursor ? regionEnd : cursor + granularity;
         }
 
-        throw new InvalidOperationException("Não foi possível reservar memória executável próxima ao ponto de hook.");
+        foreach (var candidate in candidates.OrderBy(address => Math.Abs(address - targetValue)))
+        {
+            var allocated = NativeMethods.VirtualAllocEx(
+                _handle,
+                (nint)candidate,
+                (UIntPtr)size,
+                NativeMethods.AllocationType.Commit | NativeMethods.AllocationType.Reserve,
+                NativeMethods.MemoryProtection.ExecuteReadWrite);
+
+            if (allocated == IntPtr.Zero)
+                continue;
+
+            var distance = allocated.ToInt64() - targetValue;
+            if (distance >= int.MinValue && distance <= int.MaxValue)
+                return allocated;
+
+            NativeMethods.VirtualFreeEx(_handle, allocated, UIntPtr.Zero, NativeMethods.FreeType.Release);
+        }
+
+        throw new InvalidOperationException(
+            $"Não foi encontrada região MEM_FREE executável dentro de ±0x{maxDistance:X} do hook (candidatos={candidates.Count}).");
     }
 
     public void FreeRemote(nint address)
