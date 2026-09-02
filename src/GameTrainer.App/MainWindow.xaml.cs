@@ -12,7 +12,6 @@ public partial class MainWindow : Window
     private readonly CrimsonDesertModule _module = new();
     private readonly GameProcessDetector _detector = new();
     private readonly ProcessMemory _memory = new();
-    private readonly MemoryDiscoveryScanner _discovery;
     private readonly System.Windows.Threading.DispatcherTimer _processTimer;
     private readonly System.Windows.Threading.DispatcherTimer _trainerTimer;
 
@@ -22,13 +21,11 @@ public partial class MainWindow : Window
     private bool _trainerTickRunning;
     private bool _initialScanStarted;
     private bool _isClosing;
-    private bool _discoveryBusy;
 
     public MainWindow()
     {
         InitializeComponent();
         SectionsControl.ItemsSource = _module.Definition.Sections;
-        _discovery = new MemoryDiscoveryScanner(_memory);
 
         _processTimer = new System.Windows.Threading.DispatcherTimer
         {
@@ -74,7 +71,7 @@ public partial class MainWindow : Window
 
                 _attachedProcessId = null;
                 GameStatusText.Text = "Aguardando o Crimson Desert ser iniciado...";
-                TrainerStatusText.Text = "Abra o jogo e carregue o personagem para ativar as modificações.";
+                TrainerStatusText.Text = "Abra o jogo e carregue o personagem. O trainer fará a resolução automaticamente.";
                 StatusBadge.Text = "DESCONECTADO";
                 return;
             }
@@ -88,7 +85,7 @@ public partial class MainWindow : Window
                 _memory.Attach(process);
                 _attachedProcessId = process.Id;
 
-                TrainerStatusText.Text = "Jogo detectado. Analisando a memória em segundo plano...";
+                TrainerStatusText.Text = "Jogo detectado. Localizando jogador e atributos automaticamente...";
                 StatusBadge.Text = "ANALISANDO";
 
                 await Task.Run(() => _module.AttachAsync(_memory));
@@ -98,7 +95,7 @@ public partial class MainWindow : Window
             }
 
             TrainerStatusText.Text = _module.RuntimeStatus;
-            StatusBadge.Text = _module.IsRuntimeResolved ? "CONECTADO" : "DIAGNÓSTICO";
+            StatusBadge.Text = _module.IsRuntimeResolved ? "PRONTO" : "DIAGNÓSTICO";
         }
         catch (Exception ex)
         {
@@ -117,7 +114,7 @@ public partial class MainWindow : Window
 
     private async Task RunTrainerTickAsync()
     {
-        if (_trainerTickRunning || !_memory.IsAttached || _isClosing || _discoveryBusy)
+        if (_trainerTickRunning || !_memory.IsAttached || _isClosing)
             return;
 
         _trainerTickRunning = true;
@@ -125,10 +122,12 @@ public partial class MainWindow : Window
         {
             await _module.TickAsync();
             TrainerStatusText.Text = _module.RuntimeStatus;
+            StatusBadge.Text = _module.IsRuntimeResolved ? "PRONTO" : "DIAGNÓSTICO";
         }
         catch (Exception ex)
         {
             TrainerStatusText.Text = $"Falha no ciclo do trainer: {ex.Message}";
+            StatusBadge.Text = "ERRO";
         }
         finally
         {
@@ -155,7 +154,7 @@ public partial class MainWindow : Window
                 return;
 
             TrainerStatusText.Text = _module.RuntimeStatus;
-            StatusBadge.Text = ok ? "CONECTADO" : "DIAGNÓSTICO";
+            StatusBadge.Text = ok ? "PRONTO" : "DIAGNÓSTICO";
         }
         catch (Exception ex)
         {
@@ -174,7 +173,7 @@ public partial class MainWindow : Window
             ? "Processo: não conectado"
             : $"Processo: {_memory.Process.ProcessName}.exe | PID {_memory.Process.Id} | versão {version ?? "desconhecida"}";
 
-        var report = $"Game Trainer v0.2.7{Environment.NewLine}" +
+        var report = $"Game Trainer v0.2.8{Environment.NewLine}" +
                      $"{processInfo}{Environment.NewLine}" +
                      $"Status: {_module.RuntimeStatus}{Environment.NewLine}{Environment.NewLine}" +
                      _module.DiagnosticReport;
@@ -188,145 +187,6 @@ public partial class MainWindow : Window
         {
             TrainerStatusText.Text = $"Não foi possível copiar o diagnóstico: {ex.Message}";
         }
-    }
-
-    private async void StartDiscovery_Click(object sender, RoutedEventArgs e)
-    {
-        if (!_memory.IsAttached)
-        {
-            DiscoveryStatusText.Text = "O Crimson Desert precisa estar conectado antes de iniciar o mapeamento.";
-            return;
-        }
-
-        await RunDiscoveryActionAsync(async () =>
-        {
-            DiscoveryStatusText.Text = "Capturando memória base para Vida. Aguarde...";
-            await _discovery.CaptureBaselineAsync("Vida");
-            DiscoveryStatusText.Text = $"Base de Vida capturada ({_discovery.CapturedRegions} regiões / {_discovery.CapturedBytes / (1024d * 1024):F1} MB). Agora tome dano no jogo e clique em “Registrar perda de Vida”.";
-            StartDiscoveryButton.IsEnabled = false;
-            RecordHealthButton.IsEnabled = true;
-        });
-    }
-
-    private async void RecordHealth_Click(object sender, RoutedEventArgs e)
-    {
-        await RunDiscoveryActionAsync(async () =>
-        {
-            DiscoveryStatusText.Text = "Comparando a memória após a perda de Vida...";
-            var result = await _discovery.CaptureDecreaseAsync("VIDA");
-            DiscoveryStatusText.Text = $"Vida registrada: {result.TotalCandidates} candidatos retidos. Capturando nova base para Vigor...";
-            await _discovery.CaptureBaselineAsync("Vigor");
-            DiscoveryStatusText.Text = "Base de Vigor pronta. Agora corra/gaste stamina no jogo e clique em “Registrar gasto de Vigor”.";
-            RecordHealthButton.IsEnabled = false;
-            RecordStaminaButton.IsEnabled = true;
-        });
-    }
-
-    private async void RecordStamina_Click(object sender, RoutedEventArgs e)
-    {
-        await RunDiscoveryActionAsync(async () =>
-        {
-            DiscoveryStatusText.Text = "Comparando a memória após o gasto de Vigor...";
-            var result = await _discovery.CaptureDecreaseAsync("VIGOR");
-            DiscoveryStatusText.Text = $"Vigor registrado: {result.TotalCandidates} candidatos retidos. Capturando nova base para Espírito...";
-            await _discovery.CaptureBaselineAsync("Espírito");
-            DiscoveryStatusText.Text = "Base de Espírito pronta. Agora gaste Espírito no jogo e clique em “Registrar gasto de Espírito”.";
-            RecordStaminaButton.IsEnabled = false;
-            RecordSpiritButton.IsEnabled = true;
-        });
-    }
-
-    private async void RecordSpirit_Click(object sender, RoutedEventArgs e)
-    {
-        await RunDiscoveryActionAsync(async () =>
-        {
-            DiscoveryStatusText.Text = "Comparando a memória após o gasto de Espírito...";
-            var result = await _discovery.CaptureDecreaseAsync("ESPÍRITO");
-            DiscoveryStatusText.Text = $"Espírito registrado: {result.TotalCandidates} candidatos retidos. Clique em “Finalizar análise e copiar log”.";
-            RecordSpiritButton.IsEnabled = false;
-            FinishDiscoveryButton.IsEnabled = true;
-        });
-    }
-
-    private void FinishDiscovery_Click(object sender, RoutedEventArgs e)
-    {
-        if (_memory.Process is null)
-        {
-            DiscoveryStatusText.Text = "O processo do jogo não está mais conectado.";
-            return;
-        }
-
-        var version = TryGetVersion(_memory.Process) ?? "desconhecida";
-        var report = _discovery.BuildReport(version);
-
-        try
-        {
-            Clipboard.SetText(report);
-            DiscoveryStatusText.Text = "Análise finalizada e log copiado. Cole o conteúdo aqui na conversa.";
-            FinishDiscoveryButton.IsEnabled = false;
-            StartDiscoveryButton.IsEnabled = true;
-        }
-        catch (Exception ex)
-        {
-            DiscoveryStatusText.Text = $"A análise terminou, mas não foi possível copiar o log: {ex.Message}";
-        }
-    }
-
-    private async Task RunDiscoveryActionAsync(Func<Task> action)
-    {
-        if (_discoveryBusy)
-            return;
-
-        _discoveryBusy = true;
-        SetDiscoveryButtonsEnabled(false);
-        StatusBadge.Text = "MAPEANDO";
-
-        try
-        {
-            await action();
-        }
-        catch (Exception ex)
-        {
-            DiscoveryStatusText.Text = $"Falha no mapeamento: {ex.Message}";
-            StartDiscoveryButton.IsEnabled = true;
-        }
-        finally
-        {
-            _discoveryBusy = false;
-            StatusBadge.Text = _module.IsRuntimeResolved ? "CONECTADO" : "DIAGNÓSTICO";
-            RestoreDiscoveryStepButtonState();
-        }
-    }
-
-    private void SetDiscoveryButtonsEnabled(bool enabled)
-    {
-        StartDiscoveryButton.IsEnabled = enabled;
-        RecordHealthButton.IsEnabled = enabled;
-        RecordStaminaButton.IsEnabled = enabled;
-        RecordSpiritButton.IsEnabled = enabled;
-        FinishDiscoveryButton.IsEnabled = enabled;
-    }
-
-    private void RestoreDiscoveryStepButtonState()
-    {
-        if (FinishDiscoveryButton.IsEnabled)
-            return;
-
-        if (RecordSpiritButton.IsEnabled || RecordStaminaButton.IsEnabled || RecordHealthButton.IsEnabled)
-            return;
-
-        // O próprio passo atual é reabilitado dentro da ação; caso uma ação falhe,
-        // permitimos reiniciar o mapeamento sem fechar o aplicativo.
-        if (_discovery.Results.Count == 0)
-            StartDiscoveryButton.IsEnabled = true;
-        else if (!_discovery.Results.ContainsKey("VIDA"))
-            RecordHealthButton.IsEnabled = true;
-        else if (!_discovery.Results.ContainsKey("VIGOR"))
-            RecordStaminaButton.IsEnabled = true;
-        else if (!_discovery.Results.ContainsKey("ESPÍRITO"))
-            RecordSpiritButton.IsEnabled = true;
-        else
-            FinishDiscoveryButton.IsEnabled = true;
     }
 
     private async void FeatureToggle_Checked(object sender, RoutedEventArgs e)
@@ -357,7 +217,7 @@ public partial class MainWindow : Window
         if (!_module.IsRuntimeResolved && enabled)
         {
             SetToggleVisual(toggle, false);
-            TrainerStatusText.Text = "Aguarde a análise da memória terminar antes de ativar uma modificação.";
+            TrainerStatusText.Text = "Os atributos do jogador ainda não foram validados. Use Reanalisar memória ou Copiar diagnóstico.";
             return;
         }
 
