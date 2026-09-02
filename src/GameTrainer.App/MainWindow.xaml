@@ -1,8 +1,8 @@
 <Window x:Class="GameTrainer.App.MainWindow"
         xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
         xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
-        Title="Game Trainer" Height="820" Width="1180"
-        MinHeight="640" MinWidth="900"
+        Title="Game Trainer" Height="900" Width="1180"
+        MinHeight="700" MinWidth="900"
         Background="{StaticResource BackgroundBrush}"
         Foreground="{StaticResource TextBrush}"
         WindowStartupLocation="CenterScreen">
@@ -73,7 +73,7 @@
                     <Button Content="Biblioteca" Height="42" Margin="0,0,0,8" HorizontalContentAlignment="Left" Padding="14,0" />
                     <Button Content="Crimson Desert" Height="42" HorizontalContentAlignment="Left" Padding="14,0" />
                 </StackPanel>
-                <TextBlock DockPanel.Dock="Bottom" Text="v0.2.6 • ActorManager Probe" Foreground="{StaticResource MutedTextBrush}" FontSize="12" />
+                <TextBlock DockPanel.Dock="Bottom" Text="v0.2.7 • Memory Discovery" Foreground="{StaticResource MutedTextBrush}" FontSize="12" />
             </DockPanel>
         </Border>
 
@@ -100,7 +100,7 @@
                                FontSize="12" TextWrapping="Wrap" />
                 </Border>
 
-                <StackPanel Orientation="Horizontal" Margin="0,0,0,22">
+                <StackPanel Orientation="Horizontal" Margin="0,0,0,18">
                     <Button Content="Reanalisar memória"
                             Style="{StaticResource DiagnosticButton}"
                             Click="Reprobe_Click"
@@ -109,6 +109,55 @@
                             Style="{StaticResource DiagnosticButton}"
                             Click="CopyDiagnostic_Click" />
                 </StackPanel>
+
+                <Border Background="#11171B" BorderBrush="#2E3A40" BorderThickness="1" CornerRadius="14" Padding="20" Margin="0,0,0,22">
+                    <StackPanel>
+                        <TextBlock Text="Descoberta de memória" FontSize="18" FontWeight="SemiBold" />
+                        <TextBlock Text="Modo somente-leitura para descobrir Vida, Vigor e Espírito pela mudança real dos valores durante o jogo."
+                                   Foreground="{StaticResource MutedTextBrush}" FontSize="12" TextWrapping="Wrap" Margin="0,5,0,14" />
+
+                        <Border Background="#0E1316" CornerRadius="8" Padding="12" Margin="0,0,0,14">
+                            <TextBlock x:Name="DiscoveryStatusText"
+                                       Text="Clique em Iniciar mapeamento. O aplicativo capturará a memória base para Vida."
+                                       Foreground="#D7DDE2" FontSize="12" TextWrapping="Wrap" />
+                        </Border>
+
+                        <WrapPanel>
+                            <Button x:Name="StartDiscoveryButton"
+                                    Content="1. Iniciar mapeamento"
+                                    Style="{StaticResource DiagnosticButton}"
+                                    Click="StartDiscovery_Click"
+                                    Margin="0,0,10,10" />
+                            <Button x:Name="RecordHealthButton"
+                                    Content="2. Registrar perda de Vida"
+                                    Style="{StaticResource DiagnosticButton}"
+                                    Click="RecordHealth_Click"
+                                    IsEnabled="False"
+                                    Margin="0,0,10,10" />
+                            <Button x:Name="RecordStaminaButton"
+                                    Content="3. Registrar gasto de Vigor"
+                                    Style="{StaticResource DiagnosticButton}"
+                                    Click="RecordStamina_Click"
+                                    IsEnabled="False"
+                                    Margin="0,0,10,10" />
+                            <Button x:Name="RecordSpiritButton"
+                                    Content="4. Registrar gasto de Espírito"
+                                    Style="{StaticResource DiagnosticButton}"
+                                    Click="RecordSpirit_Click"
+                                    IsEnabled="False"
+                                    Margin="0,0,10,10" />
+                            <Button x:Name="FinishDiscoveryButton"
+                                    Content="5. Finalizar análise e copiar log"
+                                    Style="{StaticResource DiagnosticButton}"
+                                    Click="FinishDiscovery_Click"
+                                    IsEnabled="False"
+                                    Margin="0,0,10,10" />
+                        </WrapPanel>
+
+                        <TextBlock Text="Fluxo: iniciar → perder Vida → registrar → correr/gastar Vigor → registrar → gastar Espírito → registrar → finalizar."
+                                   Foreground="{StaticResource MutedTextBrush}" FontSize="11" TextWrapping="Wrap" />
+                    </StackPanel>
+                </Border>
 
                 <ItemsControl x:Name="SectionsControl">
                     <ItemsControl.ItemTemplate>
