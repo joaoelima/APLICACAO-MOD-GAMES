@@ -99,11 +99,49 @@ public sealed class ProcessMemory : IDisposable
             throw new Win32Exception();
     }
 
+    public void WriteProtectedBytes(nint address, ReadOnlySpan<byte> bytes)
+    {
+        EnsureAttached();
+        var size = (UIntPtr)bytes.Length;
+        if (!NativeMethods.VirtualProtectEx(_handle, address, size, NativeMethods.MemoryProtection.ExecuteReadWrite, out var oldProtect))
+            throw new Win32Exception();
+
+        try
+        {
+            WriteBytes(address, bytes);
+            NativeMethods.FlushInstructionCache(_handle, address, size);
+        }
+        finally
+        {
+            NativeMethods.VirtualProtectEx(_handle, address, size, oldProtect, out _);
+        }
+    }
+
     public void Write<T>(nint address, T value) where T : unmanaged
     {
         var buffer = new byte[Marshal.SizeOf<T>()];
         MemoryMarshal.Write(buffer.AsSpan(), in value);
         WriteBytes(address, buffer);
+    }
+
+    public nint AllocateExecutable(int size)
+    {
+        EnsureAttached();
+        var result = NativeMethods.VirtualAllocEx(
+            _handle,
+            IntPtr.Zero,
+            (UIntPtr)size,
+            NativeMethods.AllocationType.Commit | NativeMethods.AllocationType.Reserve,
+            NativeMethods.MemoryProtection.ExecuteReadWrite);
+        if (result == IntPtr.Zero)
+            throw new Win32Exception();
+        return result;
+    }
+
+    public void FreeRemote(nint address)
+    {
+        if (!IsAttached || address == 0) return;
+        NativeMethods.VirtualFreeEx(_handle, address, UIntPtr.Zero, NativeMethods.FreeType.Release);
     }
 
     public IReadOnlyList<MemoryRegionInfo> GetReadableRegions(bool writableOnly = false)
