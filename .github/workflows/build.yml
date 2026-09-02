@@ -1,0 +1,36 @@
+name: Build Windows
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+    branches: [ main ]
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: windows-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Configurar .NET
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: '8.0.x'
+
+      - name: Restaurar dependências
+        run: dotnet restore GameTrainer.sln
+
+      - name: Compilar
+        run: dotnet build GameTrainer.sln --configuration Release --no-restore
+
+      - name: Publicar aplicativo
+        run: dotnet publish src/GameTrainer.App/GameTrainer.App.csproj --configuration Release --runtime win-x64 --self-contained false --output publish
+
+      - name: Disponibilizar artefato
+        uses: actions/upload-artifact@v4
+        with:
+          name: GameTrainer-win-x64
+          path: publish/
