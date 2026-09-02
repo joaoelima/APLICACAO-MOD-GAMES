@@ -86,7 +86,7 @@ public sealed class ProcessMemory : IDisposable
         value = 0;
         if (!TryRead<long>(address, out var raw)) return false;
         value = (nint)raw;
-        return IsLikelyPointer(value);
+        return IsLikelyPointer(value) && IsReadable(value);
     }
 
     public void WriteBytes(nint address, ReadOnlySpan<byte> bytes)
@@ -100,29 +100,63 @@ public sealed class ProcessMemory : IDisposable
     public void Write<T>(nint address, T value) where T : unmanaged
     {
         var buffer = new byte[Marshal.SizeOf<T>()];
-        MemoryMarshal.Write(buffer, in value);
+        MemoryMarshal.Write(buffer.AsSpan(), in value);
         WriteBytes(address, buffer);
     }
 
     public nint? FindPatternInMainModule(string signature, int chunkSize = 1024 * 1024)
     {
         EnsureAttached();
+
         var pattern = new AobPattern(signature);
-        var baseAddress = MainModuleBase;
-        var moduleSize = MainModuleSize;
-        var overlap = Math.Max(pattern.Bytes.Length - 1, 0);
+        var moduleStart = MainModuleBase.ToInt64();
+        var moduleEnd = moduleStart + MainModuleSize;
+        var cursor = moduleStart;
+        var mbiSize = (UIntPtr)Marshal.SizeOf<NativeMethods.MemoryBasicInformation>();
 
-        for (var offset = 0; offset < moduleSize; offset += chunkSize)
+        while (cursor < moduleEnd)
         {
-            var requested = Math.Min(chunkSize + overlap, moduleSize - offset);
-            if (!TryReadBytes(baseAddress + offset, requested, out var bytes))
-                continue;
-
-            for (var i = 0; i <= bytes.Length - pattern.Bytes.Length; i++)
+            if (NativeMethods.VirtualQueryEx(
+                    _handle,
+                    (nint)cursor,
+                    out var info,
+                    mbiSize) == UIntPtr.Zero)
             {
-                if (pattern.IsMatch(bytes, i))
-                    return baseAddress + offset + i;
+                cursor += 0x1000;
+                continue;
             }
+
+            var regionStart = Math.Max(info.BaseAddress.ToInt64(), moduleStart);
+            var queriedRegionEnd = info.BaseAddress.ToInt64() + (long)info.RegionSize.ToUInt64();
+            var regionEnd = Math.Min(queriedRegionEnd, moduleEnd);
+
+            if (IsReadableRegion(info) && regionEnd > regionStart)
+            {
+                var overlap = Math.Max(pattern.Bytes.Length - 1, 0);
+                var offset = regionStart;
+
+                while (offset < regionEnd)
+                {
+                    var remaining = regionEnd - offset;
+                    var requestedLong = Math.Min(chunkSize + overlap, remaining);
+                    if (requestedLong <= 0 || requestedLong > int.MaxValue)
+                        break;
+
+                    var requested = (int)requestedLong;
+                    if (TryReadBytes((nint)offset, requested, out var bytes))
+                    {
+                        for (var i = 0; i <= bytes.Length - pattern.Bytes.Length; i++)
+                        {
+                            if (pattern.IsMatch(bytes, i))
+                                return (nint)(offset + i);
+                        }
+                    }
+
+                    offset += Math.Min(chunkSize, remaining);
+                }
+            }
+
+            cursor = Math.Max(regionEnd, cursor + 0x1000);
         }
 
         return null;
@@ -144,9 +178,7 @@ public sealed class ProcessMemory : IDisposable
                 (UIntPtr)Marshal.SizeOf<NativeMethods.MemoryBasicInformation>()) == UIntPtr.Zero)
             return false;
 
-        if (info.State != NativeMethods.MemoryState.Commit) return false;
-        if ((info.Protect & NativeMethods.MemoryProtection.NoAccess) != 0) return false;
-        if ((info.Protect & NativeMethods.MemoryProtection.Guard) != 0) return false;
+        if (!IsReadableRegion(info)) return false;
 
         var regionEnd = info.BaseAddress.ToInt64() + (long)info.RegionSize.ToUInt64();
         return address.ToInt64() + length <= regionEnd;
@@ -156,6 +188,22 @@ public sealed class ProcessMemory : IDisposable
     {
         var address = value.ToInt64();
         return address >= 0x10000 && address <= 0x00007FFFFFFFFFFF;
+    }
+
+    private static bool IsReadableRegion(NativeMethods.MemoryBasicInformation info)
+    {
+        if (info.State != NativeMethods.MemoryState.Commit) return false;
+        if ((info.Protect & NativeMethods.MemoryProtection.NoAccess) != 0) return false;
+        if ((info.Protect & NativeMethods.MemoryProtection.Guard) != 0) return false;
+
+        var readable = NativeMethods.MemoryProtection.ReadOnly |
+                       NativeMethods.MemoryProtection.ReadWrite |
+                       NativeMethods.MemoryProtection.WriteCopy |
+                       NativeMethods.MemoryProtection.ExecuteRead |
+                       NativeMethods.MemoryProtection.ExecuteReadWrite |
+                       NativeMethods.MemoryProtection.ExecuteWriteCopy;
+
+        return (info.Protect & readable) != 0;
     }
 
     public void Detach()
