@@ -171,7 +171,7 @@ public partial class MainWindow : Window
             ? "Processo: não conectado"
             : $"Processo: {_memory.Process.ProcessName}.exe | PID {_memory.Process.Id} | versão {version ?? "desconhecida"}";
 
-        var report = $"Game Trainer v0.2.3{Environment.NewLine}" +
+        var report = $"Game Trainer v0.2.4{Environment.NewLine}" +
                      $"{processInfo}{Environment.NewLine}" +
                      $"Status: {_module.RuntimeStatus}{Environment.NewLine}{Environment.NewLine}" +
                      _module.DiagnosticReport;
