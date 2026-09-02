@@ -19,7 +19,7 @@
                                 CornerRadius="17"
                                 Background="#1C2126"
                                 BorderBrush="#2C333A"
-                                BorderThickness="1">">
+                                BorderThickness="1">
                             <Grid>
                                 <Grid.ColumnDefinitions>
                                     <ColumnDefinition Width="*" />
