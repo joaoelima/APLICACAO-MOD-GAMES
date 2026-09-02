@@ -1,3 +1,4 @@
+using System.Buffers.Binary;
 using GameTrainer.Core.Memory;
 using GameTrainer.Core.Models;
 using GameTrainer.Core.Modules;
@@ -6,16 +7,18 @@ namespace GameTrainer.Modules.CrimsonDesert;
 
 public sealed class CrimsonDesertModule : IGameModule
 {
+    private const uint MemPrivate = 0x20000;
+
     private const int HealthId = 0;
     private const int StaminaId = 17;
     private const int SpiritId = 18;
-
     private const int StatTypeOffset = 0x00;
     private const int StatCurrentOffset = 0x08;
     private const int StatMaxOffset = 0x18;
 
     private const int ActorManagerBodyStart = 0xD0;
     private const int ActorManagerBodyCount = 8;
+    private const int ActorManagerProbeWindow = 0x400;
 
     private const int ActorTypeComponentOffset = 0x48;
     private const int TypeComponentActorOffset = 0x08;
@@ -29,6 +32,17 @@ public sealed class CrimsonDesertModule : IGameModule
     private const int PositionXOffset = 0x90;
     private const int PositionYOffset = 0x94;
     private const int PositionZOffset = 0x98;
+
+    private const long HeapScanBudgetBytes = 768L * 1024 * 1024;
+    private const long HeapScanRadiusBytes = 32L * 1024 * 1024 * 1024;
+    private const int HeapChunkSize = 4 * 1024 * 1024;
+    private const int MaxHeapCandidates = 12;
+
+    private static readonly int[] NestedActorOffsets =
+    {
+        0x18, 0x20, 0x28, 0x30, 0x38, 0x40, 0x48, 0x50, 0x58, 0x60, 0x68,
+        0xD0, 0xD8, 0xE0, 0xE8, 0xF0, 0xF8, 0x100, 0x108, 0x168, 0x268
+    };
 
     private static readonly StatLayout[] StatLayouts =
     {
@@ -82,36 +96,37 @@ public sealed class CrimsonDesertModule : IGameModule
                     {
                         Id = "infinite-health",
                         Name = "Vida ilimitada",
-                        Description = "Restaura continuamente a vida para o valor máximo.",
+                        Description = "Mantém a vida no valor máximo enquanto estiver ativado.",
                         Type = TrainerFeatureType.Toggle
                     },
                     new()
                     {
                         Id = "infinite-stamina",
                         Name = "Vigor ilimitado",
-                        Description = "Restaura continuamente o vigor para o valor máximo.",
+                        Description = "Mantém o vigor no valor máximo enquanto estiver ativado.",
                         Type = TrainerFeatureType.Toggle
                     },
                     new()
                     {
                         Id = "infinite-spirit",
                         Name = "Espírito ilimitado",
-                        Description = "Restaura continuamente o espírito para o valor máximo.",
+                        Description = "Mantém o espírito no valor máximo enquanto estiver ativado.",
                         Type = TrainerFeatureType.Toggle
                     }
                 }
             },
             new TrainerSection
             {
-                Name = "Inimigos",
+                Name = "Combate",
                 Features = new TrainerFeature[]
                 {
                     new()
                     {
                         Id = "one-hit-kill",
                         Name = "Super Dano / Mortes com Um Golpe",
-                        Description = "Aguardando validação segura do atributo de ataque nesta build.",
-                        Type = TrainerFeatureType.Toggle
+                        Description = "Em desenvolvimento: fica indisponível até o atributo de dano ser validado com segurança.",
+                        Type = TrainerFeatureType.Toggle,
+                        IsAvailable = false
                     }
                 }
             }
@@ -123,8 +138,8 @@ public sealed class CrimsonDesertModule : IGameModule
         _memory = processMemory;
         _runtime = new PlayerRuntime();
         LastError = string.Empty;
-        DiagnosticReport = "Iniciando diagnóstico da memória do Crimson Desert...";
-        ResolveRuntime(force: true);
+        DiagnosticReport = "Iniciando resolução automática da memória do Crimson Desert...";
+        ResolveRuntime(force: true, cancellationToken);
         return Task.CompletedTask;
     }
 
@@ -140,7 +155,7 @@ public sealed class CrimsonDesertModule : IGameModule
 
         _runtime = new PlayerRuntime();
         _nextResolveAttemptUtc = DateTime.MinValue;
-        return Task.FromResult(ResolveRuntime(force: true));
+        return Task.FromResult(ResolveRuntime(force: true, cancellationToken));
     }
 
     public Task<bool> SetToggleAsync(string featureId, bool enabled, CancellationToken cancellationToken = default)
@@ -153,13 +168,11 @@ public sealed class CrimsonDesertModule : IGameModule
 
         if (featureId == "one-hit-kill")
         {
-            LastError = enabled
-                ? "Super Dano permanece desativado até validarmos o bloco de ataque desta build."
-                : string.Empty;
-            return Task.FromResult(!enabled);
+            LastError = "Super Dano ainda não está disponível nesta build.";
+            return Task.FromResult(false);
         }
 
-        if (enabled && !EnsureRuntime())
+        if (enabled && !EnsureRuntime(cancellationToken))
             return Task.FromResult(false);
 
         var success = featureId switch
@@ -187,7 +200,7 @@ public sealed class CrimsonDesertModule : IGameModule
         if (!_infiniteHealth && !_infiniteStamina && !_infiniteSpirit)
             return Task.CompletedTask;
 
-        if (!EnsureRuntime())
+        if (!EnsureRuntime(cancellationToken))
             return Task.CompletedTask;
 
         try
@@ -201,7 +214,7 @@ public sealed class CrimsonDesertModule : IGameModule
         }
         catch
         {
-            InvalidateRuntime("A estrutura do jogador mudou. Tentando localizar novamente...");
+            InvalidateRuntime("A estrutura do jogador mudou. Relocalizando automaticamente...");
         }
 
         return Task.CompletedTask;
@@ -214,15 +227,15 @@ public sealed class CrimsonDesertModule : IGameModule
         return true;
     }
 
-    private bool EnsureRuntime()
+    private bool EnsureRuntime(CancellationToken cancellationToken)
     {
         if (_runtime.IsResolved && ValidateRuntime())
             return true;
 
-        return ResolveRuntime(force: false);
+        return ResolveRuntime(force: false, cancellationToken);
     }
 
-    private bool ResolveRuntime(bool force)
+    private bool ResolveRuntime(bool force, CancellationToken cancellationToken)
     {
         if (_memory is null || !_memory.IsAttached)
             return false;
@@ -234,20 +247,24 @@ public sealed class CrimsonDesertModule : IGameModule
 
         var diagnostics = new List<string>
         {
-            "Diagnóstico v0.2.6",
+            "Diagnóstico v0.2.8",
             $"Módulo: 0x{_memory.MainModuleBase.ToInt64():X} / 0x{_memory.MainModuleSize:X} bytes",
-            "Estratégia: ActorManager body slots + type byte 0x01 + posição + Stats Component",
-            "Body slots: +0xD0..+0x108 | Type chain: +48 -> +08 -> +88 -> +01",
-            "Position chain: +40 -> +08 -> +248 -> XYZ em +90/+94/+98"
+            "Modo: resolução automática; sem mapeamento manual",
+            "Estratégia A: WorldSystem -> ActorManager -> objetos de heap validados por vtable",
+            "Estratégia B: busca automática do bloco HP/Vigor/Espírito em MEM_PRIVATE"
         };
 
         AddAobDiagnostic(diagnostics, "CurrentPlayer", CurrentPlayerPattern);
         AddAobDiagnostic(diagnostics, "PlayerBaseDiscovery", PlayerBaseDiscoveryPattern);
 
+        var heapAnchors = new HashSet<nint>();
+
         try
         {
             foreach (var pattern in WorldSystemPatterns)
             {
+                cancellationToken.ThrowIfCancellationRequested();
+
                 var match = _memory.FindPatternInMainModule(pattern.Signature);
                 if (!match.HasValue)
                 {
@@ -255,16 +272,14 @@ public sealed class CrimsonDesertModule : IGameModule
                     continue;
                 }
 
-                var globalSlot = _memory.ResolveRipRelative(
-                    match.Value,
-                    pattern.DisplacementOffset,
-                    pattern.InstructionEndOffset);
-
+                var globalSlot = _memory.ResolveRipRelative(match.Value, pattern.DisplacementOffset, pattern.InstructionEndOffset);
                 if (!_memory.TryReadPointer(globalSlot, out var worldSystem))
                 {
                     diagnostics.Add($"WorldSystem {pattern.Name}: ponteiro global inválido");
                     continue;
                 }
+
+                heapAnchors.Add(worldSystem);
 
                 if (!_memory.TryReadPointer(worldSystem + 0x30, out var actorManager))
                 {
@@ -272,28 +287,22 @@ public sealed class CrimsonDesertModule : IGameModule
                     continue;
                 }
 
+                heapAnchors.Add(actorManager);
                 diagnostics.Add($"WorldSystem {pattern.Name}: WorldSystem=0x{worldSystem.ToInt64():X}, ActorManager=0x{actorManager.ToInt64():X}");
 
-                // Mantemos o +0x28 apenas como telemetria. Na build 2692 ele apontou para dentro do módulo.
-                if (_memory.TryReadPointer(actorManager + 0x28, out var legacyUserActor))
-                {
-                    diagnostics.Add($"WorldSystem {pattern.Name}: +0x28 => 0x{legacyUserActor.ToInt64():X} ({DescribeAddress(legacyUserActor)})");
-                }
-                else
-                {
-                    diagnostics.Add($"WorldSystem {pattern.Name}: +0x28 => inválido");
-                }
+                if (_memory.TryReadPointer(actorManager + 0x28, out var oldField))
+                    diagnostics.Add($"  +0x28=0x{oldField.ToInt64():X} ({DescribeAddress(oldField)}) — somente telemetria");
 
-                if (TryResolveLocalPlayerFromActorManager(actorManager, out var runtime, out var bodyDiagnostics))
+                if (TryResolvePlayerFromActorManager(actorManager, out var runtime, out var actorDiagnostics))
                 {
                     runtime.WorldSystem = worldSystem;
                     runtime.ActorManager = actorManager;
-                    diagnostics.AddRange(bodyDiagnostics);
-                    CompleteSuccessfulResolution(runtime, $"WorldSystem {pattern.Name} / ActorManager slots", diagnostics);
+                    diagnostics.AddRange(actorDiagnostics);
+                    CompleteSuccessfulResolution(runtime, $"WorldSystem {pattern.Name} / heap actor", diagnostics);
                     return true;
                 }
 
-                diagnostics.AddRange(bodyDiagnostics);
+                diagnostics.AddRange(actorDiagnostics);
             }
 
             if (TryResolveViaPlayerBaseAob(out var aobRuntime, out var aobDetail))
@@ -312,11 +321,31 @@ public sealed class CrimsonDesertModule : IGameModule
             }
             diagnostics.Add($"PlayerBase estático: {staticDetail}");
 
+            if (heapAnchors.Count > 0
+                && TryResolveStatsByAutomaticHeapScan(heapAnchors, out var heapRuntime, out var heapDiagnostics, cancellationToken))
+            {
+                diagnostics.AddRange(heapDiagnostics);
+                CompleteSuccessfulResolution(heapRuntime, "Heap Stat Scan", diagnostics);
+                return true;
+            }
+
+            if (heapAnchors.Count > 0)
+            {
+                _ = TryResolveStatsByAutomaticHeapScan(heapAnchors, out _, out var heapFailure, cancellationToken);
+                diagnostics.AddRange(heapFailure);
+            }
+
             DiagnosticReport = string.Join(Environment.NewLine, diagnostics);
             InvalidateRuntime(
-                "ActorManager localizado, mas nenhum body slot validou como jogador local. Use “Copiar diagnóstico”.",
+                "Jogo conectado, mas os atributos desta build ainda não foram validados. Use “Copiar diagnóstico”.",
                 scheduleRetry: false,
                 preserveDiagnostic: true);
+            return false;
+        }
+        catch (OperationCanceledException)
+        {
+            RuntimeStatus = "Análise cancelada.";
+            LastError = RuntimeStatus;
             return false;
         }
         catch (Exception ex)
@@ -324,77 +353,111 @@ public sealed class CrimsonDesertModule : IGameModule
             diagnostics.Add($"Exceção: {ex.GetType().Name} - {ex.Message}");
             DiagnosticReport = string.Join(Environment.NewLine, diagnostics);
             InvalidateRuntime(
-                "Falha durante o diagnóstico da memória. Use “Copiar diagnóstico”.",
+                "Falha durante a resolução automática. Use “Copiar diagnóstico”.",
                 scheduleRetry: false,
                 preserveDiagnostic: true);
             return false;
         }
     }
 
-    private bool TryResolveLocalPlayerFromActorManager(
+    private bool TryResolvePlayerFromActorManager(
         nint actorManager,
         out PlayerRuntime runtime,
         out List<string> diagnostics)
     {
         runtime = new PlayerRuntime();
-        diagnostics = new List<string> { "ActorManager body-slot scan:" };
+        diagnostics = new List<string> { "ActorManager object scan:" };
 
-        PlayerRuntime? uniqueFallback = null;
-        var fallbackCount = 0;
+        var roots = new HashSet<nint>();
 
         for (var i = 0; i < ActorManagerBodyCount; i++)
         {
             var offset = ActorManagerBodyStart + i * 8;
-
-            if (_memory is null || !_memory.TryReadPointer(actorManager + offset, out var candidate))
-            {
-                diagnostics.Add($"  +0x{offset:X}: vazio/inválido");
-                continue;
-            }
-
-            var addressKind = DescribeAddress(candidate);
-            var typeOk = TryReadActorType(candidate, out var actorType, out var typeDetail);
-            var posOk = TryReadActorPosition(candidate, out var position, out var posDetail);
-            var statsOk = TryResolveActorStats(candidate, out var candidateRuntime, out var statsDetail);
-
-            diagnostics.Add(
-                $"  +0x{offset:X}: 0x{candidate.ToInt64():X} ({addressKind}) | " +
-                $"type={(typeOk ? $"0x{actorType:X2}" : "?")} [{typeDetail}] | " +
-                $"pos={(posOk ? $"{position.X:F2},{position.Y:F2},{position.Z:F2}" : "?")} [{posDetail}] | " +
-                $"stats={(statsOk ? "OK" : "NOK")} [{statsDetail}]");
-
-            if (typeOk && actorType == LocalPlayerType && posOk && statsOk)
-            {
-                candidateRuntime.Actor = candidate;
-                candidateRuntime.ActorManagerSlot = offset;
-                candidateRuntime.ActorType = actorType;
-                candidateRuntime.Position = position;
-                runtime = candidateRuntime;
-                diagnostics.Add($"  => Jogador local confirmado no slot +0x{offset:X} pelo type byte 0x01.");
-                return true;
-            }
-
-            // Fallback conservador: só usamos se exatamente UM slot tiver posição + stats válidos.
-            if (posOk && statsOk && !IsInsideMainModule(candidate))
-            {
-                candidateRuntime.Actor = candidate;
-                candidateRuntime.ActorManagerSlot = offset;
-                candidateRuntime.ActorType = typeOk ? actorType : null;
-                candidateRuntime.Position = position;
-                uniqueFallback = candidateRuntime;
-                fallbackCount++;
-            }
+            if (_memory is not null && _memory.TryReadPointer(actorManager + offset, out var candidate))
+                roots.Add(candidate);
         }
 
-        if (fallbackCount == 1 && uniqueFallback is not null)
+        for (var offset = 0; offset <= ActorManagerProbeWindow; offset += 8)
         {
-            runtime = uniqueFallback;
-            diagnostics.Add("  => Fallback aceito: exatamente um body slot apresentou posição e stats válidos.");
-            return true;
+            if (_memory is not null && _memory.TryReadPointer(actorManager + offset, out var candidate))
+                roots.Add(candidate);
         }
 
-        diagnostics.Add($"  => Nenhum type 0x01 confirmado. Candidatos fallback válidos: {fallbackCount}.");
-        return false;
+        var candidates = new HashSet<nint>();
+        foreach (var root in roots)
+        {
+            AddHeapObjectCandidate(candidates, root);
+            if (_memory is null || IsInsideMainModule(root) || !_memory.IsReadable(root, 0x280))
+                continue;
+
+            foreach (var nestedOffset in NestedActorOffsets)
+            {
+                if (_memory.TryReadPointer(root + nestedOffset, out var nested))
+                    AddHeapObjectCandidate(candidates, nested);
+            }
+        }
+
+        diagnostics.Add($"  raízes={roots.Count}, objetos heap/vtable={candidates.Count}");
+
+        var resolved = new List<ScoredRuntime>();
+        foreach (var candidate in candidates.Take(256))
+        {
+            if (!TryResolveActorStats(candidate, out var candidateRuntime, out var statsDetail))
+                continue;
+
+            var score = 100;
+            var typeText = "?";
+            var positionText = "?";
+
+            if (TryReadActorType(candidate, out var actorType, out _))
+            {
+                candidateRuntime.ActorType = actorType;
+                typeText = $"0x{actorType:X2}";
+                score += actorType == LocalPlayerType ? 50 : 5;
+            }
+
+            if (TryReadActorPosition(candidate, out var position, out _))
+            {
+                candidateRuntime.Position = position;
+                candidateRuntime.HasPosition = true;
+                positionText = $"{position.X:F1},{position.Y:F1},{position.Z:F1}";
+                score += 20;
+            }
+
+            candidateRuntime.Actor = candidate;
+            resolved.Add(new ScoredRuntime(candidateRuntime, score, statsDetail));
+            diagnostics.Add($"  candidato 0x{candidate.ToInt64():X}: score={score}, type={typeText}, pos={positionText}, {statsDetail}");
+        }
+
+        if (resolved.Count == 0)
+        {
+            diagnostics.Add("  nenhum objeto candidato apresentou tripla de stats válida");
+            return false;
+        }
+
+        var ordered = resolved.OrderByDescending(r => r.Score).ToArray();
+        var best = ordered[0];
+
+        if (ordered.Length > 1 && ordered[1].Score == best.Score && best.Score < 150)
+        {
+            diagnostics.Add($"  resolução ambígua: {ordered.Length} candidatos; dois melhores empataram em {best.Score}");
+            return false;
+        }
+
+        runtime = best.Runtime;
+        diagnostics.Add($"  => ator selecionado: 0x{runtime.Actor.ToInt64():X}, score={best.Score}");
+        return true;
+    }
+
+    private void AddHeapObjectCandidate(HashSet<nint> candidates, nint candidate)
+    {
+        if (_memory is null || candidate == 0 || IsInsideMainModule(candidate) || !_memory.IsReadable(candidate, 0x60))
+            return;
+
+        // Método inspirado em object discovery por RTTI/vtable: um objeto C++ de heap
+        // normalmente começa com um ponteiro de vtable que cai dentro do módulo do jogo.
+        if (_memory.TryReadPointer(candidate, out var vtable) && IsInsideMainModule(vtable))
+            candidates.Add(candidate);
     }
 
     private bool TryReadActorType(nint candidate, out byte type, out string detail)
@@ -408,27 +471,12 @@ public sealed class CrimsonDesertModule : IGameModule
             return false;
         }
 
-        if (!_memory.TryReadPointer(candidate + ActorTypeComponentOffset, out var component))
+        if (!_memory.TryReadPointer(candidate + ActorTypeComponentOffset, out var component)
+            || !_memory.TryReadPointer(component + TypeComponentActorOffset, out var actorForType)
+            || !_memory.TryReadPointer(actorForType + TypeActorTypePtrOffset, out var typePtr)
+            || !_memory.TryRead<byte>(typePtr + TypeByteOffset, out type))
         {
-            detail = "+48 inválido";
-            return false;
-        }
-
-        if (!_memory.TryReadPointer(component + TypeComponentActorOffset, out var actorForType))
-        {
-            detail = $"comp=0x{component.ToInt64():X}, +08 inválido";
-            return false;
-        }
-
-        if (!_memory.TryReadPointer(actorForType + TypeActorTypePtrOffset, out var typePtr))
-        {
-            detail = $"typeActor=0x{actorForType.ToInt64():X}, +88 inválido";
-            return false;
-        }
-
-        if (!_memory.TryRead<byte>(typePtr + TypeByteOffset, out type))
-        {
-            detail = $"typePtr=0x{typePtr.ToInt64():X}, +01 ilegível";
+            detail = "cadeia de tipo não validou";
             return false;
         }
 
@@ -447,29 +495,14 @@ public sealed class CrimsonDesertModule : IGameModule
             return false;
         }
 
-        if (!_memory.TryReadPointer(actor + ActorToInnerOffset, out var inner))
-        {
-            detail = "+40 inválido";
-            return false;
-        }
-
-        if (!_memory.TryReadPointer(inner + InnerToCoreOffset, out var core))
-        {
-            detail = $"inner=0x{inner.ToInt64():X}, +08 inválido";
-            return false;
-        }
-
-        if (!_memory.TryReadPointer(core + CoreToPositionStructOffset, out var posStruct))
-        {
-            detail = $"core=0x{core.ToInt64():X}, +248 inválido";
-            return false;
-        }
-
-        if (!_memory.TryRead<float>(posStruct + PositionXOffset, out var x)
+        if (!_memory.TryReadPointer(actor + ActorToInnerOffset, out var inner)
+            || !_memory.TryReadPointer(inner + InnerToCoreOffset, out var core)
+            || !_memory.TryReadPointer(core + CoreToPositionStructOffset, out var posStruct)
+            || !_memory.TryRead<float>(posStruct + PositionXOffset, out var x)
             || !_memory.TryRead<float>(posStruct + PositionYOffset, out var y)
             || !_memory.TryRead<float>(posStruct + PositionZOffset, out var z))
         {
-            detail = $"posStruct=0x{posStruct.ToInt64():X}, XYZ ilegível";
+            detail = "cadeia de posição não validou";
             return false;
         }
 
@@ -498,7 +531,6 @@ public sealed class CrimsonDesertModule : IGameModule
             return false;
         }
 
-        // Caminho 1: actor + 0x58 -> stats component.
         if (_memory.TryReadPointer(actor + 0x58, out var directStats))
         {
             if (TryBuildRuntimeFromStatsBase(actor, directStats, out runtime, out var directDetail))
@@ -506,39 +538,45 @@ public sealed class CrimsonDesertModule : IGameModule
                 detail = $"actor+58 => {directDetail}";
                 return true;
             }
-            attempts.Add($"actor+58=0x{directStats.ToInt64():X}: {directDetail}");
-        }
-        else
-        {
-            attempts.Add("actor+58 inválido");
+            attempts.Add($"+58=0x{directStats.ToInt64():X}");
         }
 
-        // Caminho 2: actor +20 -> marker +18 -> root +58 -> stats.
         if (_memory.TryReadPointer(actor + 0x20, out var marker)
-            && _memory.TryReadPointer(marker + 0x18, out var root))
+            && _memory.TryReadPointer(marker + 0x18, out var root)
+            && _memory.TryReadPointer(root + 0x58, out var rootedStats))
         {
-            if (_memory.TryReadPointer(root + 0x58, out var rootedStats))
+            if (TryBuildRuntimeFromStatsBase(actor, rootedStats, out runtime, out var rootedDetail))
             {
-                if (TryBuildRuntimeFromStatsBase(actor, rootedStats, out runtime, out var rootedDetail))
-                {
-                    runtime.Marker = marker;
-                    runtime.Root = root;
-                    detail = $"marker/root => {rootedDetail}";
-                    return true;
-                }
-                attempts.Add($"root+58=0x{rootedStats.ToInt64():X}: {rootedDetail}");
+                runtime.Marker = marker;
+                runtime.Root = root;
+                detail = $"marker/root => {rootedDetail}";
+                return true;
             }
-            else
-            {
-                attempts.Add($"marker=0x{marker.ToInt64():X}, root=0x{root.ToInt64():X}, root+58 inválido");
-            }
-        }
-        else
-        {
-            attempts.Add("marker/root inválido");
+            attempts.Add($"root+58=0x{rootedStats.ToInt64():X}");
         }
 
-        detail = string.Join(" | ", attempts);
+        // Alguns patches movem o componente dentro do objeto. Fazemos uma busca pequena,
+        // somente por ponteiros do próprio ator, e validamos a tripla completa antes de aceitar.
+        for (var offset = 0; offset <= 0x180; offset += 8)
+        {
+            if (!_memory.TryReadPointer(actor + offset, out var child))
+                continue;
+
+            if (TryBuildRuntimeFromStatsBase(actor, child, out runtime, out var childDetail))
+            {
+                detail = $"actor+0x{offset:X} -> stats => {childDetail}";
+                return true;
+            }
+
+            if (_memory.TryReadPointer(child + 0x58, out var nestedStats)
+                && TryBuildRuntimeFromStatsBase(actor, nestedStats, out runtime, out var nestedDetail))
+            {
+                detail = $"actor+0x{offset:X} -> child+58 => {nestedDetail}";
+                return true;
+            }
+        }
+
+        detail = attempts.Count == 0 ? "nenhum componente de stats validou" : string.Join(", ", attempts) + "; tripla inválida";
         return false;
     }
 
@@ -573,8 +611,165 @@ public sealed class CrimsonDesertModule : IGameModule
             return true;
         }
 
-        detail = DescribeStatsBase(statsBase);
+        detail = "bloco não corresponde a nenhum layout conhecido";
         return false;
+    }
+
+    private bool TryResolveStatsByAutomaticHeapScan(
+        IEnumerable<nint> anchors,
+        out PlayerRuntime runtime,
+        out List<string> diagnostics,
+        CancellationToken cancellationToken)
+    {
+        runtime = new PlayerRuntime();
+        diagnostics = new List<string> { "Automatic heap stat scan:" };
+
+        if (_memory is null)
+        {
+            diagnostics.Add("  memória indisponível");
+            return false;
+        }
+
+        var anchorValues = anchors.Select(a => a.ToInt64()).Where(a => a > 0).Distinct().ToArray();
+        if (anchorValues.Length == 0)
+        {
+            diagnostics.Add("  nenhuma âncora dinâmica disponível");
+            return false;
+        }
+
+        var regions = _memory.GetReadableRegions(writableOnly: true)
+            .Where(r => r.Type == MemPrivate && r.Size >= 0x1000 && r.BaseAddress.ToInt64() >= 0x1_0000_0000L)
+            .Select(r => new RankedRegion(r, DistanceToAnchors(r, anchorValues)))
+            .Where(r => r.Distance <= HeapScanRadiusBytes)
+            .OrderBy(r => r.Distance)
+            .ThenBy(r => r.Region.BaseAddress.ToInt64())
+            .ToArray();
+
+        diagnostics.Add($"  regiões privadas próximas: {regions.Length}; orçamento={HeapScanBudgetBytes / (1024 * 1024)} MB");
+
+        var found = new Dictionary<long, HeapStatsCandidate>();
+        long scanned = 0;
+
+        foreach (var ranked in regions)
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+            if (scanned >= HeapScanBudgetBytes || found.Count >= MaxHeapCandidates)
+                break;
+
+            var region = ranked.Region;
+            var regionOffset = 0L;
+
+            while (regionOffset < region.Size && scanned < HeapScanBudgetBytes && found.Count < MaxHeapCandidates)
+            {
+                cancellationToken.ThrowIfCancellationRequested();
+
+                var remainingRegion = region.Size - regionOffset;
+                var remainingBudget = HeapScanBudgetBytes - scanned;
+                var baseLength = (int)Math.Min(Math.Min(HeapChunkSize, remainingRegion), remainingBudget);
+                if (baseLength < 0x1000)
+                    break;
+
+                var overlap = 0x600;
+                var requested = (int)Math.Min(remainingRegion, (long)baseLength + overlap);
+                var chunkAddress = region.BaseAddress + regionOffset;
+
+                if (_memory.TryReadBytes(chunkAddress, requested, out var bytes))
+                    ScanStatsChunk(chunkAddress, bytes, baseLength, found);
+
+                scanned += baseLength;
+                regionOffset += baseLength;
+            }
+        }
+
+        diagnostics.Add($"  varrido={scanned / (1024d * 1024):F1} MB; triplas válidas={found.Count}");
+        foreach (var candidate in found.Values.Take(8))
+            diagnostics.Add($"  candidato 0x{candidate.StatsBase:X}: {candidate.Layout.Name}, HP={candidate.Health.Current}/{candidate.Health.Max}, STA={candidate.Stamina.Current}/{candidate.Stamina.Max}, SPI={candidate.Spirit.Current}/{candidate.Spirit.Max}");
+
+        if (found.Count != 1)
+        {
+            if (found.Count > 1)
+                diagnostics.Add("  resultado ambíguo; nenhuma escrita será habilitada até existir uma única tripla válida");
+            return false;
+        }
+
+        var winner = found.Values.Single();
+        runtime.IsResolved = true;
+        runtime.StatsBase = (nint)winner.StatsBase;
+        runtime.HealthEntry = (nint)winner.StatsBase;
+        runtime.StaminaEntry = (nint)(winner.StatsBase + winner.Layout.StaminaFromHealth);
+        runtime.SpiritEntry = (nint)(winner.StatsBase + winner.Layout.SpiritFromHealth);
+        runtime.LayoutName = winner.Layout.Name + "/heap";
+        return true;
+    }
+
+    private void ScanStatsChunk(
+        nint chunkAddress,
+        byte[] bytes,
+        int primaryLength,
+        Dictionary<long, HeapStatsCandidate> output)
+    {
+        var maximumOffset = StatLayouts.Max(l => l.SpiritFromHealth) + 0x20;
+        var scanLimit = Math.Min(primaryLength, bytes.Length - maximumOffset);
+        if (scanLimit <= 0)
+            return;
+
+        for (var offset = 0; offset <= scanLimit; offset += 8)
+        {
+            if (BinaryPrimitives.ReadInt32LittleEndian(bytes.AsSpan(offset, 4)) != HealthId)
+                continue;
+
+            if (!TryReadStatFromBuffer(bytes, offset, HealthId, out var health))
+                continue;
+
+            foreach (var layout in StatLayouts)
+            {
+                if (!TryReadStatFromBuffer(bytes, offset + layout.StaminaFromHealth, StaminaId, out var stamina)
+                    || !TryReadStatFromBuffer(bytes, offset + layout.SpiritFromHealth, SpiritId, out var spirit))
+                    continue;
+
+                var address = chunkAddress.ToInt64() + offset;
+                output.TryAdd(address, new HeapStatsCandidate(address, layout, health, stamina, spirit));
+            }
+        }
+    }
+
+    private static bool TryReadStatFromBuffer(byte[] bytes, int offset, int expectedType, out StatSnapshot stat)
+    {
+        stat = default;
+        if (offset < 0 || offset + 0x20 > bytes.Length)
+            return false;
+
+        var type = BinaryPrimitives.ReadInt32LittleEndian(bytes.AsSpan(offset + StatTypeOffset, 4));
+        if (type != expectedType)
+            return false;
+
+        var current = BinaryPrimitives.ReadInt64LittleEndian(bytes.AsSpan(offset + StatCurrentOffset, 8));
+        var max = BinaryPrimitives.ReadInt64LittleEndian(bytes.AsSpan(offset + StatMaxOffset, 8));
+        if (!PlausibleStatValues(current, max))
+            return false;
+
+        stat = new StatSnapshot(type, current, max);
+        return true;
+    }
+
+    private static long DistanceToAnchors(MemoryRegionInfo region, IReadOnlyList<long> anchors)
+    {
+        var start = region.BaseAddress.ToInt64();
+        var end = start + region.Size;
+        var best = long.MaxValue;
+
+        foreach (var anchor in anchors)
+        {
+            var distance = anchor >= start && anchor < end
+                ? 0
+                : anchor < start
+                    ? start - anchor
+                    : anchor - end;
+            if (distance < best)
+                best = distance;
+        }
+
+        return best;
     }
 
     private bool ValidateStatEntry(nint entry, int expectedType, out StatSnapshot snapshot)
@@ -584,43 +779,23 @@ public sealed class CrimsonDesertModule : IGameModule
         if (_memory is null || entry == 0 || !_memory.IsReadable(entry, 0x20))
             return false;
 
-        if (!_memory.TryRead<int>(entry + StatTypeOffset, out var type) || type != expectedType)
+        if (!_memory.TryRead<int>(entry + StatTypeOffset, out var type) || type != expectedType
+            || !_memory.TryRead<long>(entry + StatCurrentOffset, out var current)
+            || !_memory.TryRead<long>(entry + StatMaxOffset, out var max)
             return false;
 
-        if (!_memory.TryRead<long>(entry + StatCurrentOffset, out var current)
-            || !_memory.TryRead<long>(entry + StatMaxOffset, out var max))
-            return false;
-
-        if (max <= 0 || max > 10_000_000_000_000L || current < 0 || current > max * 20L)
+        if (!PlausibleStatValues(current, max))
             return false;
 
         snapshot = new StatSnapshot(type, current, max);
         return true;
     }
 
-    private string DescribeStatsBase(nint statsBase)
-    {
-        var parts = new List<string> { $"stats=0x{statsBase.ToInt64():X} ({DescribeAddress(statsBase)})" };
-        DescribeRawEntry(parts, "HP+000", statsBase);
-        DescribeRawEntry(parts, "STA+510", statsBase + 0x510);
-        DescribeRawEntry(parts, "SPI+5A0", statsBase + 0x5A0);
-        DescribeRawEntry(parts, "STAleg+480", statsBase + 0x480);
-        return string.Join("; ", parts);
-    }
-
-    private void DescribeRawEntry(List<string> parts, string label, nint entry)
-    {
-        if (_memory is null || !_memory.IsReadable(entry, 0x20))
-        {
-            parts.Add($"{label}=ilegível");
-            return;
-        }
-
-        _memory.TryRead<int>(entry, out var type);
-        _memory.TryRead<long>(entry + 0x08, out var current);
-        _memory.TryRead<long>(entry + 0x18, out var max);
-        parts.Add($"{label}[type={type},cur={current},max={max}]");
-    }
+    private static bool PlausibleStatValues(long current, long max)
+        => max > 0
+           && max < 10_000_000_000_000L
+           && current >= 0
+           && current <= Math.Min(100_000_000_000_000L, max * 20L);
 
     private bool TryResolveViaPlayerBaseAob(out PlayerRuntime runtime, out string detail)
     {
@@ -684,11 +859,14 @@ public sealed class CrimsonDesertModule : IGameModule
                 continue;
             }
 
-            if (TryReadActorPosition(candidate, out var pos, out _)
-                && TryResolveActorStats(candidate, out runtime, out var statsDetail))
+            if (TryResolveActorStats(candidate, out runtime, out var statsDetail))
             {
                 runtime.Actor = candidate;
-                runtime.Position = pos;
+                if (TryReadActorPosition(candidate, out var pos, out _))
+                {
+                    runtime.Position = pos;
+                    runtime.HasPosition = true;
+                }
                 detail = $"base=0x{playerBase.ToInt64():X}, slot=+0x{slot:X}, actor=0x{candidate.ToInt64():X}; {statsDetail}";
                 return true;
             }
@@ -703,7 +881,6 @@ public sealed class CrimsonDesertModule : IGameModule
     private bool TryResolvePointerChain(nint baseAddress, IReadOnlyList<int> offsets, out nint value)
     {
         value = baseAddress;
-
         if (_memory is null || value == 0)
             return false;
 
@@ -731,7 +908,7 @@ public sealed class CrimsonDesertModule : IGameModule
     {
         if (_memory is null || !ValidateStatEntry(entry, expectedType, out var stat))
         {
-            InvalidateRuntime($"{label}: bloco de atributo deixou de validar. Relocalizando...");
+            InvalidateRuntime($"{label}: bloco de atributo deixou de validar. Relocalizando automaticamente...");
             return;
         }
 
@@ -740,31 +917,29 @@ public sealed class CrimsonDesertModule : IGameModule
     }
 
     private bool ValidateRuntime()
-    {
-        return _runtime.IsResolved
-               && ValidateStatEntry(_runtime.HealthEntry, HealthId, out _)
-               && ValidateStatEntry(_runtime.StaminaEntry, StaminaId, out _)
-               && ValidateStatEntry(_runtime.SpiritEntry, SpiritId, out _);
-    }
+        => _runtime.IsResolved
+           && ValidateStatEntry(_runtime.HealthEntry, HealthId, out _)
+           && ValidateStatEntry(_runtime.StaminaEntry, StaminaId, out _)
+           && ValidateStatEntry(_runtime.SpiritEntry, SpiritId, out _);
 
-    private void CompleteSuccessfulResolution(
-        PlayerRuntime runtime,
-        string method,
-        List<string> diagnostics)
+    private void CompleteSuccessfulResolution(PlayerRuntime runtime, string method, List<string> diagnostics)
     {
         _runtime = runtime;
         diagnostics.Add($"Método vencedor: {method}");
-        diagnostics.Add($"Actor: 0x{runtime.Actor.ToInt64():X} ({DescribeAddress(runtime.Actor)})");
-        diagnostics.Add($"ActorManager slot: +0x{runtime.ActorManagerSlot:X}");
-        diagnostics.Add($"Actor type: {(runtime.ActorType.HasValue ? $"0x{runtime.ActorType.Value:X2}" : "fallback")}");
-        diagnostics.Add($"Position: {runtime.Position.X:F2}, {runtime.Position.Y:F2}, {runtime.Position.Z:F2}");
+        if (runtime.Actor != 0)
+            diagnostics.Add($"Actor: 0x{runtime.Actor.ToInt64():X} ({DescribeAddress(runtime.Actor)})");
+        if (runtime.ActorType.HasValue)
+            diagnostics.Add($"Actor type: 0x{runtime.ActorType.Value:X2}");
+        if (runtime.HasPosition)
+            diagnostics.Add($"Position: {runtime.Position.X:F2}, {runtime.Position.Y:F2}, {runtime.Position.Z:F2}");
         diagnostics.Add($"StatsBase: 0x{runtime.StatsBase.ToInt64():X}");
         diagnostics.Add($"HealthEntry: 0x{runtime.HealthEntry.ToInt64():X}");
         diagnostics.Add($"StaminaEntry: 0x{runtime.StaminaEntry.ToInt64():X}");
         diagnostics.Add($"SpiritEntry: 0x{runtime.SpiritEntry.ToInt64():X}");
+        diagnostics.Add($"Layout: {runtime.LayoutName}");
 
         DiagnosticReport = string.Join(Environment.NewLine, diagnostics);
-        RuntimeStatus = $"Jogador localizado • {method} • {runtime.LayoutName}";
+        RuntimeStatus = $"Pronto • {runtime.LayoutName} • Vida/Vigor/Espírito validados";
         LastError = string.Empty;
     }
 
@@ -776,11 +951,9 @@ public sealed class CrimsonDesertModule : IGameModule
         var value = address.ToInt64();
         var start = _memory.MainModuleBase.ToInt64();
         var end = start + _memory.MainModuleSize;
-
-        if (value >= start && value < end)
-            return $"módulo+0x{value - start:X}";
-
-        return "memória dinâmica";
+        return value >= start && value < end
+            ? $"módulo+0x{value - start:X}"
+            : "memória dinâmica";
     }
 
     private bool IsInsideMainModule(nint address)
@@ -794,10 +967,7 @@ public sealed class CrimsonDesertModule : IGameModule
         return value >= start && value < end;
     }
 
-    private void InvalidateRuntime(
-        string reason,
-        bool scheduleRetry = true,
-        bool preserveDiagnostic = false)
+    private void InvalidateRuntime(string reason, bool scheduleRetry = true, bool preserveDiagnostic = false)
     {
         _runtime = new PlayerRuntime();
         RuntimeStatus = reason;
@@ -807,29 +977,18 @@ public sealed class CrimsonDesertModule : IGameModule
             DiagnosticReport = reason;
 
         if (scheduleRetry)
-            _nextResolveAttemptUtc = DateTime.UtcNow.AddMilliseconds(500);
+            _nextResolveAttemptUtc = DateTime.UtcNow.AddMilliseconds(750);
     }
 
-    private static string FormatStat(StatSnapshot stat)
-        => $"{stat.Current}/{stat.Max}";
+    private static string FormatStat(StatSnapshot stat) => $"{stat.Current}/{stat.Max}";
 
-    private readonly record struct WorldSystemPattern(
-        string Name,
-        string Signature,
-        int DisplacementOffset,
-        int InstructionEndOffset);
-
-    private readonly record struct StatLayout(
-        int StaminaFromHealth,
-        int SpiritFromHealth,
-        string Name);
-
-    private readonly record struct StatSnapshot(
-        int Type,
-        long Current,
-        long Max);
-
+    private readonly record struct WorldSystemPattern(string Name, string Signature, int DisplacementOffset, int InstructionEndOffset);
+    private readonly record struct StatLayout(int StaminaFromHealth, int SpiritFromHealth, string Name);
+    private readonly record struct StatSnapshot(int Type, long Current, long Max);
     private readonly record struct PositionSnapshot(float X, float Y, float Z);
+    private readonly record struct ScoredRuntime(PlayerRuntime Runtime, int Score, string Detail);
+    private readonly record struct RankedRegion(MemoryRegionInfo Region, long Distance);
+    private readonly record struct HeapStatsCandidate(long StatsBase, StatLayout Layout, StatSnapshot Health, StatSnapshot Stamina, StatSnapshot Spirit);
 
     private sealed class PlayerRuntime
     {
@@ -839,9 +998,9 @@ public sealed class CrimsonDesertModule : IGameModule
         public nint WorldSystem { get; set; }
         public nint ActorManager { get; set; }
         public nint Actor { get; set; }
-        public int ActorManagerSlot { get; set; }
         public byte? ActorType { get; set; }
         public PositionSnapshot Position { get; set; }
+        public bool HasPosition { get; set; }
 
         public nint Marker { get; set; }
         public nint Root { get; set; }
