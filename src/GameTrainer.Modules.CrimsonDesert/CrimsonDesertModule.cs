@@ -8,17 +8,19 @@ namespace GameTrainer.Modules.CrimsonDesert;
 public sealed class CrimsonDesertModule : IGameModule
 {
     private const uint MemPrivate = 0x20000;
-    private const int CurrentOffset = 0x08;
-    private const int MaxOffset = 0x18;
-    private const long ScanBudget = 768L * 1024 * 1024;
+    private const long StatScanBudget = 768L * 1024 * 1024;
     private const long BackRefBudget = 512L * 1024 * 1024;
     private const int ChunkSize = 4 * 1024 * 1024;
 
-    private static readonly StatLayout[] Layouts =
-    {
-        new(0x510, 0x5A0, "Int64-mai-2026"),
-        new(0x480, 0x510, "Int64-legado")
-    };
+    // Layout usado pela tabela pública atual do bbfox (01/08/2026):
+    // current/max = 4 bytes; Max fica +0x10 a partir do Current.
+    private const int HpCurrent = 0x08;
+    private const int HpMax = 0x18;
+    private const int StaminaCurrent = 0x6C8;
+    private const int StaminaMax = 0x6D8;
+    private const int SpiritCurrent = 0x758;
+    private const int SpiritMax = 0x768;
+    private const int MaxLayoutOffset = SpiritMax + 4;
 
     private static readonly WorldPattern[] WorldPatterns =
     {
@@ -51,9 +53,9 @@ public sealed class CrimsonDesertModule : IGameModule
                 Name = "Jogador",
                 Features = new TrainerFeature[]
                 {
-                    new() { Id = "infinite-health", Name = "Vida ilimitada", Description = "Mantém a vida no valor máximo.", Type = TrainerFeatureType.Toggle },
-                    new() { Id = "infinite-stamina", Name = "Vigor ilimitado", Description = "Mantém o vigor no valor máximo.", Type = TrainerFeatureType.Toggle },
-                    new() { Id = "infinite-spirit", Name = "Espírito ilimitado", Description = "Mantém o espírito no valor máximo.", Type = TrainerFeatureType.Toggle }
+                    new() { Id = "infinite-health", Name = "Vida ilimitada", Description = "Mantém a vida preenchida enquanto estiver ativado.", Type = TrainerFeatureType.Toggle },
+                    new() { Id = "infinite-stamina", Name = "Vigor ilimitado", Description = "Mantém o vigor preenchido enquanto estiver ativado.", Type = TrainerFeatureType.Toggle },
+                    new() { Id = "infinite-spirit", Name = "Espírito ilimitado", Description = "Mantém o espírito preenchido enquanto estiver ativado.", Type = TrainerFeatureType.Toggle }
                 }
             },
             new TrainerSection
@@ -122,9 +124,9 @@ public sealed class CrimsonDesertModule : IGameModule
         if (!EnsureRuntime(cancellationToken))
             return Task.CompletedTask;
 
-        if (_health) Restore(_runtime.Health, 0, "Vida");
-        if (_stamina) Restore(_runtime.Stamina, 17, "Vigor");
-        if (_spirit) Restore(_runtime.Spirit, 18, "Espírito");
+        if (_health) Restore(_runtime.HealthCurrent, _runtime.HealthMax, "Vida");
+        if (_stamina) Restore(_runtime.StaminaCurrent, _runtime.StaminaMax, "Vigor");
+        if (_spirit) Restore(_runtime.SpiritCurrent, _runtime.SpiritMax, "Espírito");
         return Task.CompletedTask;
     }
 
@@ -138,6 +140,7 @@ public sealed class CrimsonDesertModule : IGameModule
     {
         if (_memory is null || !_memory.IsAttached) return false;
         if (!force && DateTime.UtcNow < _nextResolve) return false;
+
         _nextResolve = DateTime.UtcNow.AddSeconds(2);
         RuntimeStatus = "Analisando automaticamente a memória do jogo...";
 
@@ -145,8 +148,9 @@ public sealed class CrimsonDesertModule : IGameModule
         {
             "Diagnóstico v0.2.8",
             $"Módulo: 0x{_memory.MainModuleBase.ToInt64():X} / 0x{_memory.MainModuleSize:X} bytes",
-            "Modo: resolução automática; sem mapeamento manual",
-            "Seleção: tripla de stats + backlink de objeto/vtable + type/posição quando disponíveis"
+            "Layout: bbfox 2026-08-01 / 4 Bytes",
+            "Offsets: HP +8/+18 | Vigor +6C8/+6D8 | Espírito +758/+768",
+            "Seleção: stats plausíveis -> root+58 -> marker+18 -> actor+20 -> vtable/type/posição"
         };
 
         var anchors = new HashSet<nint>();
@@ -162,6 +166,7 @@ public sealed class CrimsonDesertModule : IGameModule
 
             var slot = _memory.ResolveRipRelative(match.Value, pattern.Disp, pattern.End);
             if (!_memory.TryReadPointer(slot, out var world)) continue;
+
             anchors.Add(world);
             log.Add($"WorldSystem {pattern.Name}: 0x{world.ToInt64():X}");
             if (_memory.TryReadPointer(world + 0x30, out var manager))
@@ -171,240 +176,278 @@ public sealed class CrimsonDesertModule : IGameModule
             }
         }
 
-        if (anchors.Count > 0 && TryHeapScan(anchors, out var state, out var scanLog, ct))
+        if (anchors.Count > 0 && TryResolveCurrentLayout(anchors, out var state, out var scanLog, ct))
         {
             _runtime = state;
             log.AddRange(scanLog);
             log.Add($"Método vencedor: {_runtime.Method}");
-            if (_runtime.Actor != 0)
-                log.Add($"Actor/Object: 0x{_runtime.Actor.ToInt64():X}");
-            log.Add($"StatsBase: 0x{_runtime.Stats.ToInt64():X}");
-            log.Add($"HealthEntry: 0x{_runtime.Health.ToInt64():X}");
-            log.Add($"StaminaEntry: 0x{_runtime.Stamina.ToInt64():X}");
-            log.Add($"SpiritEntry: 0x{_runtime.Spirit.ToInt64():X}");
-            log.Add($"Layout: {_runtime.Layout}");
+            log.Add($"StatsBase: 0x{_runtime.StatsBase.ToInt64():X}");
+            if (_runtime.Actor != 0) log.Add($"Actor: 0x{_runtime.Actor.ToInt64():X}");
+            log.Add($"HP current/max: 0x{_runtime.HealthCurrent.ToInt64():X} / 0x{_runtime.HealthMax.ToInt64():X}");
+            log.Add($"STA current/max: 0x{_runtime.StaminaCurrent.ToInt64():X} / 0x{_runtime.StaminaMax.ToInt64():X}");
+            log.Add($"SPI current/max: 0x{_runtime.SpiritCurrent.ToInt64():X} / 0x{_runtime.SpiritMax.ToInt64():X}");
             DiagnosticReport = string.Join(Environment.NewLine, log);
-            RuntimeStatus = $"Pronto • {_runtime.Layout} • Vida/Vigor/Espírito validados";
+            RuntimeStatus = "Pronto • layout 4 Bytes validado • Vida/Vigor/Espírito disponíveis";
             LastError = string.Empty;
             return true;
         }
 
         if (anchors.Count > 0)
         {
-            _ = TryHeapScan(anchors, out _, out var failedScanLog, ct);
-            log.AddRange(failedScanLog);
+            _ = TryResolveCurrentLayout(anchors, out _, out var failureLog, ct);
+            log.AddRange(failureLog);
         }
 
         DiagnosticReport = string.Join(Environment.NewLine, log);
-        RuntimeStatus = "Jogo conectado, mas os atributos desta build ainda não foram validados. Use “Copiar diagnóstico”.";
+        RuntimeStatus = "Jogo conectado, mas o jogador ainda não foi identificado com segurança. Use “Copiar diagnóstico”.";
         LastError = RuntimeStatus;
         return false;
     }
 
-    private bool TryHeapScan(IEnumerable<nint> anchors, out RuntimeState state, out List<string> log, CancellationToken ct)
+    private bool TryResolveCurrentLayout(
+        IEnumerable<nint> anchors,
+        out RuntimeState state,
+        out List<string> log,
+        CancellationToken ct)
     {
         state = new RuntimeState();
-        log = new List<string> { "Heap stat scan:" };
-        var anchorValues = anchors.Select(a => a.ToInt64()).Distinct().ToArray();
-        var regions = _memory!.GetReadableRegions(true)
-            .Where(r => r.Type == MemPrivate && r.Size >= 0x1000 && r.BaseAddress.ToInt64() >= 0x1_0000_0000L)
-            .OrderBy(r => Distance(r, anchorValues))
-            .ToArray();
+        log = new List<string> { "4-byte stat scan:" };
 
-        var found = new Dictionary<long, StatCandidate>();
+        var anchorValues = anchors.Select(a => a.ToInt64()).Distinct().ToArray();
+        var regions = GetPrivateWritableRegions(anchorValues);
+        var candidates = new Dictionary<long, StatCandidate>();
         long scanned = 0;
 
         foreach (var region in regions)
         {
-            if (scanned >= ScanBudget || found.Count > 12) break;
-            long offset = 0;
-            while (offset < region.Size && scanned < ScanBudget && found.Count <= 12)
+            if (scanned >= StatScanBudget || candidates.Count > 24) break;
+            long regionOffset = 0;
+
+            while (regionOffset < region.Size && scanned < StatScanBudget && candidates.Count <= 24)
             {
                 ct.ThrowIfCancellationRequested();
-                var remaining = region.Size - offset;
-                var length = (int)Math.Min(Math.Min(ChunkSize, remaining), ScanBudget - scanned);
-                if (length < 0x1000) break;
+                var remaining = region.Size - regionOffset;
+                var primary = (int)Math.Min(Math.Min(ChunkSize, remaining), StatScanBudget - scanned);
+                if (primary < 0x1000) break;
 
-                var readLength = (int)Math.Min(remaining, (long)length + 0x600);
-                var address = region.BaseAddress + (nint)offset;
-                if (_memory.TryReadBytes(address, readLength, out var bytes))
-                    ScanBuffer(address, bytes, length, found);
+                var readLength = (int)Math.Min(remaining, (long)primary + MaxLayoutOffset);
+                var address = region.BaseAddress + (nint)regionOffset;
+                if (_memory!.TryReadBytes(address, readLength, out var bytes))
+                    Scan4ByteCandidates(address, bytes, primary, candidates);
 
-                scanned += length;
-                offset += length;
+                scanned += primary;
+                regionOffset += primary;
             }
         }
 
-        log.Add($"  varrido={scanned / (1024d * 1024):F1} MB; candidatos={found.Count}");
-        foreach (var candidate in found.Values.OrderBy(c => c.Address).Take(12))
+        log.Add($"  varrido={scanned / (1024d * 1024):F1} MB; candidatos={candidates.Count}");
+        foreach (var c in candidates.Values.OrderBy(c => c.Address).Take(20))
         {
-            log.Add(
-                $"  0x{candidate.Address:X}: {candidate.Layout.Name} | " +
-                $"HP={candidate.Health.Current}/{candidate.Health.Max} | " +
-                $"STA={candidate.Stamina.Current}/{candidate.Stamina.Max} | " +
-                $"SPI={candidate.Spirit.Current}/{candidate.Spirit.Max}");
+            log.Add($"  0x{c.Address:X} | HP={c.Health.Current}/{c.Health.Max} | STA={c.Stamina.Current}/{c.Stamina.Max} | SPI={c.Spirit.Current}/{c.Spirit.Max} | IDs={c.HealthId}/{c.StaminaId}/{c.SpiritId}");
         }
 
-        AddOverlapDiagnostics(found.Values, log);
+        if (candidates.Count == 0)
+            return false;
 
-        if (found.Count == 1)
+        if (!TryResolveBacklinkChain(candidates.Values.ToArray(), anchorValues, out var selected, out var actor, out var chainLog, ct))
         {
-            state = BuildRuntime(found.Values.Single(), 0, "Heap Stat Scan / único candidato");
-            return true;
+            log.AddRange(chainLog);
+            return false;
         }
 
-        if (found.Count > 1
-            && TrySelectByBackReferences(found.Values.ToArray(), anchorValues, out var selected, out var actor, out var backRefLog, ct))
-        {
-            log.AddRange(backRefLog);
-            state = BuildRuntime(selected, actor, "Heap Stat Scan + backlink");
-            return true;
-        }
-
-        if (found.Count > 1)
-        {
-            _ = TrySelectByBackReferences(found.Values.ToArray(), anchorValues, out _, out _, out var backRefFailure, ct);
-            log.AddRange(backRefFailure);
-        }
-
-        return false;
+        log.AddRange(chainLog);
+        state = BuildRuntime(selected, actor, "4-byte heap + reverse actor chain");
+        return true;
     }
 
-    private bool TrySelectByBackReferences(
+    private bool TryResolveBacklinkChain(
         IReadOnlyList<StatCandidate> candidates,
         IReadOnlyList<long> anchors,
         out StatCandidate selected,
-        out nint actor,
+        out nint selectedActor,
         out List<string> log,
         CancellationToken ct)
     {
         selected = default;
-        actor = 0;
-        log = new List<string> { "Backlink scan:" };
+        selectedActor = 0;
+        log = new List<string> { "Reverse pointer chain:" };
 
-        var targets = candidates.ToDictionary(c => c.Address, c => c);
-        var points = anchors.Concat(candidates.Select(c => c.Address)).Distinct().ToArray();
-        var regions = _memory!.GetReadableRegions(true)
-            .Where(r => r.Type == MemPrivate && r.Size >= 0x1000 && r.BaseAddress.ToInt64() >= 0x1_0000_0000L)
-            .OrderBy(r => Distance(r, points))
-            .ToArray();
+        var statsTargets = candidates.Select(c => c.Address).ToHashSet();
+        var statsToRoots = FindExpectedOwners(statsTargets, 0x58, anchors.Concat(statsTargets).ToArray(), ct, out var pass1Bytes);
+        log.Add($"  pass1 stats <- root+58: {statsToRoots.Sum(kv => kv.Value.Count)} refs / {pass1Bytes / (1024d * 1024):F1} MB");
 
-        var scores = candidates.ToDictionary(c => c.Address, _ => new CandidateScore());
-        long scanned = 0;
+        var rootTargets = statsToRoots.Values.SelectMany(x => x).Select(x => x.ToInt64()).ToHashSet();
+        if (rootTargets.Count == 0) return false;
 
-        foreach (var region in regions)
+        var rootToMarkers = FindExpectedOwners(rootTargets, 0x18, anchors.Concat(rootTargets).ToArray(), ct, out var pass2Bytes);
+        log.Add($"  pass2 root <- marker+18: {rootToMarkers.Sum(kv => kv.Value.Count)} refs / {pass2Bytes / (1024d * 1024):F1} MB");
+
+        var markerTargets = rootToMarkers.Values.SelectMany(x => x).Select(x => x.ToInt64()).ToHashSet();
+        if (markerTargets.Count == 0) return false;
+
+        var markerToActors = FindExpectedOwners(markerTargets, 0x20, anchors.Concat(markerTargets).ToArray(), ct, out var pass3Bytes);
+        log.Add($"  pass3 marker <- actor+20: {markerToActors.Sum(kv => kv.Value.Count)} refs / {pass3Bytes / (1024d * 1024):F1} MB");
+
+        var scored = new List<ResolvedCandidate>();
+
+        foreach (var candidate in candidates)
         {
-            if (scanned >= BackRefBudget) break;
-            long offset = 0;
-            while (offset < region.Size && scanned < BackRefBudget)
+            if (!statsToRoots.TryGetValue(candidate.Address, out var roots)) continue;
+
+            foreach (var root in roots)
             {
-                ct.ThrowIfCancellationRequested();
-                var remaining = region.Size - offset;
-                var length = (int)Math.Min(Math.Min(ChunkSize, remaining), BackRefBudget - scanned);
-                if (length < 0x1000) break;
+                if (!rootToMarkers.TryGetValue(root.ToInt64(), out var markers)) continue;
 
-                var address = region.BaseAddress + (nint)offset;
-                if (_memory.TryReadBytes(address, length, out var bytes))
-                    ScanBackReferences(address, bytes, targets, scores);
+                foreach (var marker in markers)
+                {
+                    if (!markerToActors.TryGetValue(marker.ToInt64(), out var actors)) continue;
 
-                scanned += length;
-                offset += length;
+                    foreach (var actor in actors)
+                    {
+                        if (!TryScoreActor(actor, out var score, out var detail)) continue;
+                        if (candidate.HealthId == 0 && candidate.StaminaId == 17 && candidate.SpiritId == 18) score += 30;
+
+                        scored.Add(new ResolvedCandidate(candidate, actor, score, detail));
+                        log.Add($"  0x{candidate.Address:X} -> root 0x{root.ToInt64():X} -> marker 0x{marker.ToInt64():X} -> actor 0x{actor.ToInt64():X} | score={score} | {detail}");
+                    }
+                }
             }
         }
 
-        log.Add($"  varrido={scanned / (1024d * 1024):F1} MB");
-        foreach (var candidate in candidates.OrderBy(c => c.Address))
+        if (scored.Count == 0)
         {
-            var score = scores[candidate.Address];
-            log.Add(
-                $"  0x{candidate.Address:X}: refs={score.ReferenceCount}, direct+58={score.DirectOwnerCount}, " +
-                $"score={score.BestScore}, owner={(score.BestOwner == 0 ? "-" : $"0x{score.BestOwner.ToInt64():X}")}" +
-                (string.IsNullOrWhiteSpace(score.BestDetail) ? string.Empty : $" | {score.BestDetail}"));
-        }
-
-        var ranked = candidates
-            .Select(c => new { Candidate = c, Score = scores[c.Address] })
-            .OrderByDescending(x => x.Score.BestScore)
-            .ThenByDescending(x => x.Score.DirectOwnerCount)
-            .ThenByDescending(x => x.Score.ReferenceCount)
-            .ToArray();
-
-        if (ranked.Length == 0 || ranked[0].Score.BestScore < 100)
-        {
-            log.Add("  nenhum candidato recebeu backlink direto +0x58 com objeto/vtable válida");
+            log.Add("  nenhuma cadeia completa chegou a um actor com vtable válida");
             return false;
         }
 
-        if (ranked.Length > 1
-            && ranked[1].Score.BestScore == ranked[0].Score.BestScore
-            && ranked[1].Score.DirectOwnerCount == ranked[0].Score.DirectOwnerCount)
+        var ranked = scored.OrderByDescending(x => x.Score).ToArray();
+        if (ranked.Length > 1 && ranked[1].Score == ranked[0].Score)
         {
-            log.Add("  resultado ainda ambíguo: os dois melhores candidatos empataram");
+            log.Add($"  ambíguo: dois candidatos empataram com score {ranked[0].Score}");
             return false;
         }
 
         selected = ranked[0].Candidate;
-        actor = ranked[0].Score.BestOwner;
-        log.Add($"  => vencedor 0x{selected.Address:X} ({selected.Layout.Name}), score={ranked[0].Score.BestScore}");
+        selectedActor = ranked[0].Actor;
+        log.Add($"  => vencedor: stats 0x{selected.Address:X}, actor 0x{selectedActor.ToInt64():X}, score {ranked[0].Score}");
         return true;
     }
 
-    private void ScanBackReferences(
+    private Dictionary<long, List<nint>> FindExpectedOwners(
+        IReadOnlySet<long> targets,
+        int fieldOffset,
+        IReadOnlyList<long> priority,
+        CancellationToken ct,
+        out long scannedBytes)
+    {
+        var result = targets.ToDictionary(x => x, _ => new List<nint>());
+        scannedBytes = 0;
+        if (targets.Count == 0) return result;
+
+        foreach (var region in GetPrivateWritableRegions(priority))
+        {
+            if (scannedBytes >= BackRefBudget) break;
+            long regionOffset = 0;
+
+            while (regionOffset < region.Size && scannedBytes < BackRefBudget)
+            {
+                ct.ThrowIfCancellationRequested();
+                var remaining = region.Size - regionOffset;
+                var length = (int)Math.Min(Math.Min(ChunkSize, remaining), BackRefBudget - scannedBytes);
+                if (length < 0x1000) break;
+
+                var baseAddress = region.BaseAddress + (nint)regionOffset;
+                if (_memory!.TryReadBytes(baseAddress, length, out var bytes))
+                {
+                    for (var offset = 0; offset <= bytes.Length - 8; offset += 8)
+                    {
+                        var raw = BinaryPrimitives.ReadInt64LittleEndian(bytes.AsSpan(offset, 8));
+                        if (!targets.Contains(raw)) continue;
+
+                        var pointerField = baseAddress + offset;
+                        var owner = pointerField - fieldOffset;
+                        if (_memory.IsReadable(owner, fieldOffset + 8))
+                            result[raw].Add(owner);
+                    }
+                }
+
+                scannedBytes += length;
+                regionOffset += length;
+            }
+        }
+
+        return result;
+    }
+
+    private IReadOnlyList<MemoryRegionInfo> GetPrivateWritableRegions(IReadOnlyList<long> priority)
+        => _memory!.GetReadableRegions(true)
+            .Where(r => r.Type == MemPrivate && r.Size >= 0x1000 && r.BaseAddress.ToInt64() >= 0x1_0000_0000L)
+            .OrderBy(r => Distance(r, priority))
+            .ToArray();
+
+    private static void Scan4ByteCandidates(
         nint baseAddress,
         byte[] bytes,
-        IReadOnlyDictionary<long, StatCandidate> targets,
-        IDictionary<long, CandidateScore> scores)
+        int primaryLength,
+        IDictionary<long, StatCandidate> candidates)
     {
-        for (var offset = 0; offset <= bytes.Length - 8; offset += 8)
+        var limit = Math.Min(primaryLength, bytes.Length - MaxLayoutOffset);
+        if (limit <= 0) return;
+
+        for (var offset = 0; offset <= limit; offset += 8)
         {
-            var raw = BinaryPrimitives.ReadInt64LittleEndian(bytes.AsSpan(offset, 8));
-            if (!targets.ContainsKey(raw)) continue;
+            if (!ReadPair(bytes, offset + HpCurrent, offset + HpMax, out var hp)) continue;
+            if (!ReadPair(bytes, offset + StaminaCurrent, offset + StaminaMax, out var stamina)) continue;
+            if (!ReadPair(bytes, offset + SpiritCurrent, offset + SpiritMax, out var spirit)) continue;
 
-            var score = scores[raw];
-            score.ReferenceCount++;
+            var healthId = BinaryPrimitives.ReadInt32LittleEndian(bytes.AsSpan(offset, 4));
+            var staminaId = BinaryPrimitives.ReadInt32LittleEndian(bytes.AsSpan(offset + 0x6C0, 4));
+            var spiritId = BinaryPrimitives.ReadInt32LittleEndian(bytes.AsSpan(offset + 0x750, 4));
 
-            var pointerField = baseAddress + offset;
-            var possibleOwner = pointerField - 0x58;
-            if (TryScoreOwner(possibleOwner, out var ownerScore, out var detail))
-            {
-                score.DirectOwnerCount++;
-                if (ownerScore > score.BestScore)
-                {
-                    score.BestScore = ownerScore;
-                    score.BestOwner = possibleOwner;
-                    score.BestDetail = detail;
-                }
-            }
+            var address = baseAddress.ToInt64() + offset;
+            candidates.TryAdd(address, new StatCandidate(address, hp, stamina, spirit, healthId, staminaId, spiritId));
         }
     }
 
-    private bool TryScoreOwner(nint owner, out int score, out string detail)
+    private static bool ReadPair(byte[] bytes, int currentOffset, int maxOffset, out StatPair pair)
+    {
+        pair = default;
+        if (currentOffset < 0 || maxOffset < 0 || maxOffset + 4 > bytes.Length) return false;
+
+        var current = BinaryPrimitives.ReadUInt32LittleEndian(bytes.AsSpan(currentOffset, 4));
+        var max = BinaryPrimitives.ReadUInt32LittleEndian(bytes.AsSpan(maxOffset, 4));
+        if (!Plausible(current, max)) return false;
+
+        pair = new StatPair(current, max);
+        return true;
+    }
+
+    private bool TryScoreActor(nint actor, out int score, out string detail)
     {
         score = 0;
         detail = string.Empty;
 
-        if (_memory is null || owner == 0 || IsInsideModule(owner) || !_memory.IsReadable(owner, 0x60))
+        if (_memory is null || actor == 0 || IsInsideModule(actor) || !_memory.IsReadable(actor, 0x60))
             return false;
-
-        if (!_memory.TryReadPointer(owner, out var vtable) || !IsInsideModule(vtable))
+        if (!_memory.TryReadPointer(actor, out var vtable) || !IsInsideModule(vtable))
             return false;
 
         score = 100;
-        var details = new List<string> { $"vtable=0x{vtable.ToInt64():X}" };
+        var parts = new List<string> { $"vtable=0x{vtable.ToInt64():X}" };
 
-        if (TryReadActorType(owner, out var type))
+        if (TryReadActorType(actor, out var type))
         {
-            score += type == 0x01 ? 50 : 5;
-            details.Add($"type=0x{type:X2}");
+            score += type == 0x01 ? 60 : 5;
+            parts.Add($"type=0x{type:X2}");
         }
 
-        if (TryReadPosition(owner, out var x, out var y, out var z))
+        if (TryReadPosition(actor, out var x, out var y, out var z))
         {
             score += 20;
-            details.Add($"pos={x:F1},{y:F1},{z:F1}");
+            parts.Add($"pos={x:F1},{y:F1},{z:F1}");
         }
 
-        detail = string.Join(", ", details);
+        detail = string.Join(", ", parts);
         return true;
     }
 
@@ -435,160 +478,102 @@ public sealed class CrimsonDesertModule : IGameModule
                && Math.Abs(z) < 10_000_000f;
     }
 
-    private bool IsInsideModule(nint address)
+    private bool ValidateRuntime()
+        => _runtime.IsResolved
+           && ReadLivePair(_runtime.HealthCurrent, _runtime.HealthMax, out _)
+           && ReadLivePair(_runtime.StaminaCurrent, _runtime.StaminaMax, out _)
+           && ReadLivePair(_runtime.SpiritCurrent, _runtime.SpiritMax, out _);
+
+    private bool ReadLivePair(nint currentAddress, nint maxAddress, out StatPair pair)
     {
+        pair = default;
         if (_memory is null) return false;
-        var value = address.ToInt64();
-        var start = _memory.MainModuleBase.ToInt64();
-        var end = start + _memory.MainModuleSize;
-        return value >= start && value < end;
-    }
-
-    private static void AddOverlapDiagnostics(IEnumerable<StatCandidate> candidates, List<string> log)
-    {
-        var list = candidates.OrderBy(c => c.Address).ToArray();
-        var overlaps = new List<string>();
-
-        for (var i = 0; i < list.Length; i++)
-        {
-            for (var j = i + 1; j < list.Length; j++)
-            {
-                var a = list[i];
-                var b = list[j];
-                var aStamina = a.Address + a.Layout.StaminaOffset;
-                var aSpirit = a.Address + a.Layout.SpiritOffset;
-                var bStamina = b.Address + b.Layout.StaminaOffset;
-                var bSpirit = b.Address + b.Layout.SpiritOffset;
-
-                if (aStamina == bStamina && aSpirit == bSpirit)
-                    overlaps.Add($"  sobreposição: 0x{a.Address:X}/{a.Layout.Name} e 0x{b.Address:X}/{b.Layout.Name} compartilham Vigor/Espírito");
-            }
-        }
-
-        if (overlaps.Count > 0)
-        {
-            log.Add("Estruturas sobrepostas:");
-            log.AddRange(overlaps);
-        }
-    }
-
-    private static RuntimeState BuildRuntime(StatCandidate winner, nint actor, string method)
-    {
-        var stats = (nint)winner.Address;
-        return new RuntimeState
-        {
-            IsResolved = true,
-            Actor = actor,
-            Stats = stats,
-            Health = stats,
-            Stamina = stats + winner.Layout.StaminaOffset,
-            Spirit = stats + winner.Layout.SpiritOffset,
-            Layout = winner.Layout.Name + "/heap",
-            Method = method
-        };
-    }
-
-    private static void ScanBuffer(nint baseAddress, byte[] bytes, int primaryLength, Dictionary<long, StatCandidate> found)
-    {
-        var maxOffset = Layouts.Max(l => l.SpiritOffset) + 0x20;
-        var limit = Math.Min(primaryLength, bytes.Length - maxOffset);
-        if (limit <= 0) return;
-
-        for (var offset = 0; offset <= limit; offset += 8)
-        {
-            if (!BufferedStat(bytes, offset, 0, out var health)) continue;
-
-            foreach (var layout in Layouts)
-            {
-                if (!BufferedStat(bytes, offset + layout.StaminaOffset, 17, out var stamina)) continue;
-                if (!BufferedStat(bytes, offset + layout.SpiritOffset, 18, out var spirit)) continue;
-
-                var address = baseAddress.ToInt64() + offset;
-                found.TryAdd(address, new StatCandidate(address, layout, health, stamina, spirit));
-            }
-        }
-    }
-
-    private static bool BufferedStat(byte[] bytes, int offset, int type, out Stat stat)
-    {
-        stat = default;
-        if (offset < 0 || offset + 0x20 > bytes.Length) return false;
-        if (BinaryPrimitives.ReadInt32LittleEndian(bytes.AsSpan(offset, 4)) != type) return false;
-        var current = BinaryPrimitives.ReadInt64LittleEndian(bytes.AsSpan(offset + CurrentOffset, 8));
-        var max = BinaryPrimitives.ReadInt64LittleEndian(bytes.AsSpan(offset + MaxOffset, 8));
+        if (!_memory.TryRead<uint>(currentAddress, out var current)) return false;
+        if (!_memory.TryRead<uint>(maxAddress, out var max)) return false;
         if (!Plausible(current, max)) return false;
-        stat = new Stat(current, max);
+        pair = new StatPair(current, max);
         return true;
     }
 
-    private bool ReadStat(nint address, int type, out Stat stat)
+    private void Restore(nint currentAddress, nint maxAddress, string label)
     {
-        stat = default;
-        if (!_memory!.IsReadable(address, 0x20)) return false;
-        if (!_memory.TryRead<int>(address, out var actual) || actual != type) return false;
-        if (!_memory.TryRead<long>(address + CurrentOffset, out var current)) return false;
-        if (!_memory.TryRead<long>(address + MaxOffset, out var max)) return false;
-        if (!Plausible(current, max)) return false;
-        stat = new Stat(current, max);
-        return true;
-    }
-
-    private void Restore(nint address, int type, string label)
-    {
-        if (!ReadStat(address, type, out var stat))
+        if (!ReadLivePair(currentAddress, maxAddress, out var stat))
         {
             _runtime = new RuntimeState();
             RuntimeStatus = $"{label}: endereço deixou de validar. Relocalizando...";
             return;
         }
-        if (stat.Current < stat.Max) _memory!.Write(address + CurrentOffset, stat.Max);
+
+        var target = (uint)Math.Min((ulong)uint.MaxValue, (ulong)stat.Max * 10UL);
+        if (stat.Current < target)
+            _memory!.Write(currentAddress, target);
     }
 
-    private bool ValidateRuntime()
-        => _runtime.IsResolved
-           && ReadStat(_runtime.Health, 0, out _)
-           && ReadStat(_runtime.Stamina, 17, out _)
-           && ReadStat(_runtime.Spirit, 18, out _);
+    private static bool Plausible(uint current, uint max)
+        => max > 0
+           && max <= 1_000_000_000U
+           && (ulong)current <= (ulong)max * 20UL;
 
-    private static bool Plausible(long current, long max)
-        => max > 0 && max < 10_000_000_000_000L && current >= 0 && current <= Math.Min(100_000_000_000_000L, max * 20L);
+    private bool IsInsideModule(nint address)
+    {
+        if (_memory is null) return false;
+        var value = address.ToInt64();
+        var start = _memory.MainModuleBase.ToInt64();
+        return value >= start && value < start + _memory.MainModuleSize;
+    }
 
     private static long Distance(MemoryRegionInfo region, IReadOnlyList<long> anchors)
     {
+        if (anchors.Count == 0) return long.MaxValue / 2;
         var start = region.BaseAddress.ToInt64();
         var end = start + region.Size;
         var best = long.MaxValue;
+
         foreach (var anchor in anchors)
         {
-            var distance = anchor >= start && anchor < end ? 0 : anchor < start ? start - anchor : anchor - end;
+            var distance = anchor >= start && anchor < end
+                ? 0
+                : anchor < start ? start - anchor : anchor - end;
             if (distance < best) best = distance;
         }
+
         return best;
     }
 
-    private readonly record struct WorldPattern(string Name, string Signature, int Disp, int End);
-    private readonly record struct StatLayout(int StaminaOffset, int SpiritOffset, string Name);
-    private readonly record struct Stat(long Current, long Max);
-    private readonly record struct StatCandidate(long Address, StatLayout Layout, Stat Health, Stat Stamina, Stat Spirit);
-
-    private sealed class CandidateScore
+    private static RuntimeState BuildRuntime(StatCandidate candidate, nint actor, string method)
     {
-        public int ReferenceCount { get; set; }
-        public int DirectOwnerCount { get; set; }
-        public int BestScore { get; set; }
-        public nint BestOwner { get; set; }
-        public string BestDetail { get; set; } = string.Empty;
+        var stats = (nint)candidate.Address;
+        return new RuntimeState
+        {
+            IsResolved = true,
+            Actor = actor,
+            StatsBase = stats,
+            HealthCurrent = stats + HpCurrent,
+            HealthMax = stats + HpMax,
+            StaminaCurrent = stats + StaminaCurrent,
+            StaminaMax = stats + StaminaMax,
+            SpiritCurrent = stats + SpiritCurrent,
+            SpiritMax = stats + SpiritMax,
+            Method = method
+        };
     }
+
+    private readonly record struct WorldPattern(string Name, string Signature, int Disp, int End);
+    private readonly record struct StatPair(uint Current, uint Max);
+    private readonly record struct StatCandidate(long Address, StatPair Health, StatPair Stamina, StatPair Spirit, int HealthId, int StaminaId, int SpiritId);
+    private readonly record struct ResolvedCandidate(StatCandidate Candidate, nint Actor, int Score, string Detail);
 
     private sealed class RuntimeState
     {
         public bool IsResolved { get; set; }
         public nint Actor { get; set; }
-        public nint Stats { get; set; }
-        public nint Health { get; set; }
-        public nint Stamina { get; set; }
-        public nint Spirit { get; set; }
-        public string Layout { get; set; } = string.Empty;
+        public nint StatsBase { get; set; }
+        public nint HealthCurrent { get; set; }
+        public nint HealthMax { get; set; }
+        public nint StaminaCurrent { get; set; }
+        public nint StaminaMax { get; set; }
+        public nint SpiritCurrent { get; set; }
+        public nint SpiritMax { get; set; }
         public string Method { get; set; } = string.Empty;
     }
 }
