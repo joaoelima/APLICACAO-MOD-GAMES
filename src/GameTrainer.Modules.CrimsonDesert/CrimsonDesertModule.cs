@@ -17,6 +17,9 @@ public sealed class CrimsonDesertModule : IGameModule
     private const string PlayerBaseDiscoveryPattern =
         "48 8B 0D ? ? ? ? E8 ? ? ? ? 41 B0 01 48 8B 53 08 48 8D 4C 24 40";
 
+    private const int StatsProbeWindow = 0x1000;
+    private const int ObjectPointerProbeWindow = 0x300;
+
     private static readonly StatLayout CurrentLayout = new(0x510, 0x5A0, "atual");
     private static readonly StatLayout LegacyLayout = new(0x480, 0x510, "legado");
 
@@ -230,7 +233,9 @@ public sealed class CrimsonDesertModule : IGameModule
             _originalAttack ??= resolvedAttack;
         }
 
-        if (!_memory.TryRead<int>(_runtime.AttackAddress, out var currentAttack) || currentAttack <= 0 || currentAttack > 50_000_000)
+        if (!_memory.TryRead<int>(_runtime.AttackAddress, out var currentAttack)
+            || currentAttack <= 0
+            || currentAttack > 50_000_000)
         {
             _runtime.AttackAddress = 0;
             return;
@@ -299,8 +304,9 @@ public sealed class CrimsonDesertModule : IGameModule
         _nextResolveAttemptUtc = DateTime.UtcNow.AddSeconds(2);
         var diagnostics = new List<string>
         {
-            "Diagnóstico v0.2.1",
-            $"Módulo: 0x{_memory.MainModuleBase.ToInt64():X} / 0x{_memory.MainModuleSize:X} bytes"
+            "Diagnóstico v0.2.2",
+            $"Módulo: 0x{_memory.MainModuleBase.ToInt64():X} / 0x{_memory.MainModuleSize:X} bytes",
+            "Estratégia: WorldSystem + busca dinâmica e validada do bloco HP/Vigor/Espírito"
         };
 
         try
@@ -347,7 +353,7 @@ public sealed class CrimsonDesertModule : IGameModule
 
             DiagnosticReport = string.Join(Environment.NewLine, diagnostics);
             InvalidateRuntime(
-                "Não foi possível localizar o jogador. Clique em “Reanalisar memória” e depois em “Copiar diagnóstico”.",
+                "O jogador foi encontrado, mas o bloco de atributos desta build ainda não foi identificado. Use “Copiar diagnóstico”.",
                 scheduleRetry: false,
                 preserveDiagnostic: true);
             return false;
@@ -385,7 +391,7 @@ public sealed class CrimsonDesertModule : IGameModule
     private bool TryResolvePlayerFromWorldSystem(nint worldSystem, out PlayerRuntime runtime, out string detail)
     {
         runtime = new PlayerRuntime { WorldSystem = worldSystem };
-        detail = "";
+        detail = string.Empty;
 
         if (_memory is null)
         {
@@ -420,7 +426,7 @@ public sealed class CrimsonDesertModule : IGameModule
     private bool TryResolvePlayerViaBaseSignature(out PlayerRuntime runtime, out string detail)
     {
         runtime = new PlayerRuntime();
-        detail = "";
+        detail = string.Empty;
 
         if (_memory is null)
         {
@@ -442,26 +448,27 @@ public sealed class CrimsonDesertModule : IGameModule
             return false;
         }
 
-        if (!TryResolvePointerChain(playerBase, new[] { 0x18, 0xA0, 0xD0, 0x68 }, out var actor))
+        var slotCandidates = new[] { 0x68, 0xE0, 0x168, 0x268 };
+        foreach (var slot in slotCandidates)
         {
-            detail = "base OK, cadeia +18/+A0/+D0/+68 falhou";
-            return false;
+            if (!TryResolvePointerChain(playerBase, new[] { 0x18, 0xA0, 0xD0, slot }, out var actor))
+                continue;
+
+            if (!TryResolvePlayerFromActor(actor, out runtime, out var actorDetail))
+                continue;
+
+            detail = $"assinatura/base/actor OK pelo slot +0x{slot:X}; {actorDetail}";
+            return true;
         }
 
-        if (!TryResolvePlayerFromActor(actor, out runtime, out var actorDetail))
-        {
-            detail = $"actor pela base OK, {actorDetail}";
-            return false;
-        }
-
-        detail = $"assinatura/base/actor OK; {actorDetail}";
-        return true;
+        detail = "base OK, mas nenhuma cadeia de personagem conhecida (+68/+E0/+168/+268) validou os atributos";
+        return false;
     }
 
     private bool TryResolvePlayerViaStaticBase(out PlayerRuntime runtime, out string detail)
     {
         runtime = new PlayerRuntime();
-        detail = "";
+        detail = string.Empty;
 
         if (_memory is null)
         {
@@ -476,26 +483,27 @@ public sealed class CrimsonDesertModule : IGameModule
             return false;
         }
 
-        if (!TryResolvePointerChain(playerBase, new[] { 0x18, 0xA0, 0xD0, 0x68 }, out var actor))
+        var slotCandidates = new[] { 0x68, 0xE0, 0x168, 0x268 };
+        foreach (var slot in slotCandidates)
         {
-            detail = "base válida, cadeia +18/+A0/+D0/+68 falhou";
-            return false;
+            if (!TryResolvePointerChain(playerBase, new[] { 0x18, 0xA0, 0xD0, slot }, out var actor))
+                continue;
+
+            if (!TryResolvePlayerFromActor(actor, out runtime, out var actorDetail))
+                continue;
+
+            detail = $"RVA legado/base/actor OK pelo slot +0x{slot:X}; {actorDetail}";
+            return true;
         }
 
-        if (!TryResolvePlayerFromActor(actor, out runtime, out var actorDetail))
-        {
-            detail = $"actor pela base estática OK, {actorDetail}";
-            return false;
-        }
-
-        detail = $"RVA legado/base/actor OK; {actorDetail}";
-        return true;
+        detail = "base válida, mas nenhuma cadeia de personagem conhecida validou os atributos";
+        return false;
     }
 
     private bool TryResolvePlayerFromActor(nint actor, out PlayerRuntime runtime, out string detail)
     {
         runtime = new PlayerRuntime { Actor = actor };
-        detail = "";
+        detail = string.Empty;
 
         if (_memory is null || !_memory.IsReadable(actor, 0x60))
         {
@@ -505,42 +513,34 @@ public sealed class CrimsonDesertModule : IGameModule
 
         nint marker = 0;
         nint root = 0;
+        nint playerCore = 0;
+
         if (_memory.TryReadPointer(actor + 0x20, out marker))
             _memory.TryReadPointer(marker + 0x18, out root);
 
-        nint healthEntry = 0;
-        var healthRoute = string.Empty;
+        if (_memory.TryReadPointer(actor + 0x40, out var inner))
+            _memory.TryReadPointer(inner + 0x08, out playerCore);
 
-        // Caminho publicado mais recente: actor + 0x58 -> entrada/componente de HP.
-        if (_memory.TryReadPointer(actor + 0x58, out var directHealth) && ValidateStatEntry(directHealth, HealthId))
+        if (!TryLocateStatsBlock(
+                actor,
+                marker,
+                root,
+                playerCore,
+                out var healthEntry,
+                out var staminaEntry,
+                out var spiritEntry,
+                out var layoutName,
+                out var statsRoute,
+                out var probeCount))
         {
-            healthEntry = directHealth;
-            healthRoute = "HP via Actor+0x58";
-        }
-        // Fallback legado: actor -> marker -> root -> +0x58 -> HP.
-        else if (root != 0 && _memory.TryReadPointer(root + 0x58, out var rootedHealth) && ValidateStatEntry(rootedHealth, HealthId))
-        {
-            healthEntry = rootedHealth;
-            healthRoute = "HP via Marker/Root+0x58";
-        }
-        else
-        {
-            detail = marker == 0
-                ? "Actor encontrado, mas Marker (+0x20) e HP direto (+0x58) não validaram"
-                : root == 0
-                    ? "Marker OK, Root (+0x18) inválido e HP direto (+0x58) não validou"
-                    : "Marker/Root OK, mas nenhuma entrada de HP válida foi encontrada em +0x58";
-            return false;
-        }
-
-        if (!TryResolveStatLayout(healthEntry, out var staminaEntry, out var spiritEntry, out var layoutName))
-        {
-            detail = $"{healthRoute} OK, mas offsets de Vigor/Espírito não bateram";
+            detail = $"Marker={(marker != 0 ? "OK" : "N/A")}, Root={(root != 0 ? "OK" : "N/A")}, " +
+                     $"PlayerCore={(playerCore != 0 ? "OK" : "N/A")}; busca dinâmica testou {probeCount} âncoras sem achar a tripla 0/17/18";
             return false;
         }
 
         runtime.Marker = marker;
         runtime.Root = root;
+        runtime.PlayerCore = playerCore;
         runtime.HealthEntry = healthEntry;
         runtime.StaminaEntry = staminaEntry;
         runtime.SpiritEntry = spiritEntry;
@@ -550,8 +550,165 @@ public sealed class CrimsonDesertModule : IGameModule
         if (root != 0 && TryResolveAttack(out var attackAddress, out _, root))
             runtime.AttackAddress = attackAddress;
 
-        detail = $"{healthRoute}; Vigor/Espírito layout {layoutName}";
+        detail = $"Stats localizados por {statsRoute}; layout {layoutName}; {probeCount} âncoras avaliadas";
         return true;
+    }
+
+    private bool TryLocateStatsBlock(
+        nint actor,
+        nint marker,
+        nint root,
+        nint playerCore,
+        out nint healthEntry,
+        out nint staminaEntry,
+        out nint spiritEntry,
+        out string layoutName,
+        out string route,
+        out int probeCount)
+    {
+        healthEntry = 0;
+        staminaEntry = 0;
+        spiritEntry = 0;
+        layoutName = string.Empty;
+        route = string.Empty;
+        probeCount = 0;
+
+        if (_memory is null)
+            return false;
+
+        var probes = new List<StatsProbe>();
+        var seen = new HashSet<long>();
+
+        void AddProbe(string name, nint address)
+        {
+            if (address == 0 || !ProcessMemory.IsLikelyPointer(address) || !_memory.IsReadable(address))
+                return;
+
+            if (seen.Add(address.ToInt64()))
+                probes.Add(new StatsProbe(name, address));
+        }
+
+        // Primeiro os caminhos documentados/publicados, tanto como ponteiro quanto inline.
+        AddProbe("Actor", actor);
+        AddProbe("Actor+0x58 inline", actor + 0x58);
+        if (_memory.TryReadPointer(actor + 0x58, out var actor58))
+            AddProbe("Actor+0x58 -> ptr", actor58);
+
+        if (marker != 0)
+        {
+            AddProbe("Marker", marker);
+            AddProbe("Marker+0x58 inline", marker + 0x58);
+            if (_memory.TryReadPointer(marker + 0x58, out var marker58))
+                AddProbe("Marker+0x58 -> ptr", marker58);
+        }
+
+        if (root != 0)
+        {
+            AddProbe("Root", root);
+            AddProbe("Root+0x58 inline", root + 0x58);
+            if (_memory.TryReadPointer(root + 0x58, out var root58))
+                AddProbe("Root+0x58 -> ptr", root58);
+        }
+
+        if (playerCore != 0)
+            AddProbe("PlayerCore", playerCore);
+
+        // Builds novas podem mover o ponteiro do componente dentro do Actor/Root/Core.
+        AddPointerFieldProbes(actor, "Actor", probes, seen);
+        if (marker != 0)
+            AddPointerFieldProbes(marker, "Marker", probes, seen);
+        if (root != 0)
+            AddPointerFieldProbes(root, "Root", probes, seen);
+        if (playerCore != 0)
+            AddPointerFieldProbes(playerCore, "PlayerCore", probes, seen);
+
+        // Alguns caminhos públicos expõem o personagem controlado em slots/children.
+        foreach (var offset in new[] { 0x68, 0xD0, 0xD8, 0xE0, 0xE8, 0xF0, 0xF8, 0x100, 0x108, 0x168, 0x268 })
+        {
+            if (!_memory.TryReadPointer(actor + offset, out var child))
+                continue;
+
+            AddProbe($"Actor+0x{offset:X} -> child", child);
+            AddPointerFieldProbes(child, $"Child@+0x{offset:X}", probes, seen, 0x180);
+        }
+
+        foreach (var probe in probes.Take(192))
+        {
+            probeCount++;
+            if (!TryFindStatTripletNear(
+                    probe.Address,
+                    out healthEntry,
+                    out staminaEntry,
+                    out spiritEntry,
+                    out layoutName,
+                    out var healthOffset))
+                continue;
+
+            route = healthOffset == 0
+                ? probe.Name
+                : $"{probe.Name} +0x{healthOffset:X}";
+            return true;
+        }
+
+        return false;
+    }
+
+    private void AddPointerFieldProbes(
+        nint objectBase,
+        string label,
+        List<StatsProbe> probes,
+        HashSet<long> seen,
+        int window = ObjectPointerProbeWindow)
+    {
+        if (_memory is null || objectBase == 0)
+            return;
+
+        for (var offset = 0; offset <= window; offset += 0x08)
+        {
+            if (!_memory.TryReadPointer(objectBase + offset, out var candidate))
+                continue;
+
+            if (!seen.Add(candidate.ToInt64()))
+                continue;
+
+            probes.Add(new StatsProbe($"{label}+0x{offset:X} -> ptr", candidate));
+            if (probes.Count >= 256)
+                return;
+        }
+    }
+
+    private bool TryFindStatTripletNear(
+        nint anchor,
+        out nint healthEntry,
+        out nint staminaEntry,
+        out nint spiritEntry,
+        out string layoutName,
+        out int healthOffset)
+    {
+        healthEntry = 0;
+        staminaEntry = 0;
+        spiritEntry = 0;
+        layoutName = string.Empty;
+        healthOffset = 0;
+
+        if (_memory is null || anchor == 0)
+            return false;
+
+        for (var offset = 0; offset <= StatsProbeWindow; offset += 0x08)
+        {
+            var candidate = anchor + offset;
+            if (!ValidateStatEntry(candidate, HealthId))
+                continue;
+
+            if (!TryResolveStatLayout(candidate, out staminaEntry, out spiritEntry, out layoutName))
+                continue;
+
+            healthEntry = candidate;
+            healthOffset = offset;
+            return true;
+        }
+
+        return false;
     }
 
     private bool TryResolvePointerChain(nint baseAddress, IReadOnlyList<int> offsets, out nint value)
@@ -579,6 +736,31 @@ public sealed class CrimsonDesertModule : IGameModule
             if (ValidateStatEntry(staminaEntry, StaminaId) && ValidateStatEntry(spiritEntry, SpiritId))
             {
                 layoutName = layout.Name;
+                return true;
+            }
+        }
+
+        // Fallback da v0.2.2: descobre os offsets em tempo de execução dentro
+        // de uma janela pequena do mesmo componente. Só aceita se os IDs 17 e 18
+        // também tiverem current/max plausíveis.
+        nint dynamicStamina = 0;
+        nint dynamicSpirit = 0;
+
+        for (var offset = 0x20; offset <= StatsProbeWindow; offset += 0x10)
+        {
+            var candidate = healthEntry + offset;
+
+            if (dynamicStamina == 0 && ValidateStatEntry(candidate, StaminaId))
+                dynamicStamina = candidate;
+
+            if (dynamicSpirit == 0 && ValidateStatEntry(candidate, SpiritId))
+                dynamicSpirit = candidate;
+
+            if (dynamicStamina != 0 && dynamicSpirit != 0)
+            {
+                staminaEntry = dynamicStamina;
+                spiritEntry = dynamicSpirit;
+                layoutName = $"dinâmico (Sta +0x{(dynamicStamina - healthEntry):X}, Spi +0x{(dynamicSpirit - healthEntry):X})";
                 return true;
             }
         }
@@ -637,7 +819,11 @@ public sealed class CrimsonDesertModule : IGameModule
             || !_memory.TryRead<long>(entry + MaxValueOffset, out var max))
             return false;
 
-        return max > 0 && max < 10_000_000_000_000L && current >= 0 && current <= max * 2;
+        if (max <= 0 || max >= 10_000_000_000_000L)
+            return false;
+
+        // Buffs/debuffs podem deixar o valor atual temporariamente acima do máximo base.
+        return current >= 0 && current <= max * 8;
     }
 
     private void InvalidateRuntime(
@@ -662,6 +848,7 @@ public sealed class CrimsonDesertModule : IGameModule
         int InstructionEndOffset);
 
     private readonly record struct StatLayout(int StaminaFromHealth, int SpiritFromHealth, string Name);
+    private readonly record struct StatsProbe(string Name, nint Address);
 
     private sealed class PlayerRuntime
     {
@@ -671,6 +858,7 @@ public sealed class CrimsonDesertModule : IGameModule
         public nint Actor { get; set; }
         public nint Marker { get; set; }
         public nint Root { get; set; }
+        public nint PlayerCore { get; set; }
         public nint HealthEntry { get; set; }
         public nint StaminaEntry { get; set; }
         public nint SpiritEntry { get; set; }
