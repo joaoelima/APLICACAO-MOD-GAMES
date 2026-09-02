@@ -1,13 +1,35 @@
 using System.ComponentModel;
 using System.Diagnostics;
+using System.Runtime.InteropServices;
 
 namespace GameTrainer.Core.Memory;
 
 public sealed class ProcessMemory : IDisposable
 {
     private IntPtr _handle;
+
     public Process? Process { get; private set; }
     public bool IsAttached => _handle != IntPtr.Zero && Process is { HasExited: false };
+
+    public nint MainModuleBase
+    {
+        get
+        {
+            EnsureAttached();
+            return Process!.MainModule?.BaseAddress
+                   ?? throw new InvalidOperationException("Não foi possível obter o módulo principal do jogo.");
+        }
+    }
+
+    public int MainModuleSize
+    {
+        get
+        {
+            EnsureAttached();
+            return Process!.MainModule?.ModuleMemorySize
+                   ?? throw new InvalidOperationException("Não foi possível obter o tamanho do módulo principal do jogo.");
+        }
+    }
 
     public void Attach(Process process)
     {
@@ -33,12 +55,107 @@ public sealed class ProcessMemory : IDisposable
         return buffer;
     }
 
+    public bool TryReadBytes(nint address, int length, out byte[] buffer)
+    {
+        buffer = new byte[length];
+        if (!IsAttached) return false;
+        return NativeMethods.ReadProcessMemory(_handle, address, buffer, length, out var read)
+               && read.ToInt64() == length;
+    }
+
+    public T Read<T>(nint address) where T : unmanaged
+    {
+        var size = Marshal.SizeOf<T>();
+        var bytes = ReadBytes(address, size);
+        return MemoryMarshal.Read<T>(bytes);
+    }
+
+    public bool TryRead<T>(nint address, out T value) where T : unmanaged
+    {
+        value = default;
+        var size = Marshal.SizeOf<T>();
+        if (!TryReadBytes(address, size, out var bytes)) return false;
+        value = MemoryMarshal.Read<T>(bytes);
+        return true;
+    }
+
+    public nint ReadPointer(nint address) => (nint)Read<long>(address);
+
+    public bool TryReadPointer(nint address, out nint value)
+    {
+        value = 0;
+        if (!TryRead<long>(address, out var raw)) return false;
+        value = (nint)raw;
+        return IsLikelyPointer(value);
+    }
+
     public void WriteBytes(nint address, ReadOnlySpan<byte> bytes)
     {
         EnsureAttached();
         var buffer = bytes.ToArray();
         if (!NativeMethods.WriteProcessMemory(_handle, address, buffer, buffer.Length, out var written) || written.ToInt64() != buffer.Length)
             throw new Win32Exception();
+    }
+
+    public void Write<T>(nint address, T value) where T : unmanaged
+    {
+        var buffer = new byte[Marshal.SizeOf<T>()];
+        MemoryMarshal.Write(buffer, in value);
+        WriteBytes(address, buffer);
+    }
+
+    public nint? FindPatternInMainModule(string signature, int chunkSize = 1024 * 1024)
+    {
+        EnsureAttached();
+        var pattern = new AobPattern(signature);
+        var baseAddress = MainModuleBase;
+        var moduleSize = MainModuleSize;
+        var overlap = Math.Max(pattern.Bytes.Length - 1, 0);
+
+        for (var offset = 0; offset < moduleSize; offset += chunkSize)
+        {
+            var requested = Math.Min(chunkSize + overlap, moduleSize - offset);
+            if (!TryReadBytes(baseAddress + offset, requested, out var bytes))
+                continue;
+
+            for (var i = 0; i <= bytes.Length - pattern.Bytes.Length; i++)
+            {
+                if (pattern.IsMatch(bytes, i))
+                    return baseAddress + offset + i;
+            }
+        }
+
+        return null;
+    }
+
+    public nint ResolveRipRelative(nint instructionAddress, int displacementOffset, int instructionEndOffset)
+    {
+        var displacement = Read<int>(instructionAddress + displacementOffset);
+        return instructionAddress + instructionEndOffset + displacement;
+    }
+
+    public bool IsReadable(nint address, int length = 1)
+    {
+        if (!IsAttached || address == 0) return false;
+        if (NativeMethods.VirtualQueryEx(
+                _handle,
+                address,
+                out var info,
+                (UIntPtr)Marshal.SizeOf<NativeMethods.MemoryBasicInformation>()) == UIntPtr.Zero)
+            return false;
+
+        if (info.State != NativeMethods.MemoryState.Commit) return false;
+        if ((info.Protect & NativeMethods.MemoryProtection.NoAccess) != 0) return false;
+        if ((info.Protect & NativeMethods.MemoryProtection.Guard) != 0) return false;
+
+        var regionEnd = info.BaseAddress.ToInt64() + (long)info.RegionSize.ToUInt64();
+        return address.ToInt64() + length <= regionEnd;
+    }
+
+    public static bool IsLikelyPointer(nint value)
+    {
+        var address = value.ToInt64();
+        return address >= 0x10000 && address <= 0x00007FFFFFFFFFFF;
     }
 
     public void Detach()
