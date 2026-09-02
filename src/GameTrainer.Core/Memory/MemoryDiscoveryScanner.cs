@@ -6,14 +6,17 @@ namespace GameTrainer.Core.Memory;
 
 public sealed class MemoryDiscoveryScanner
 {
-    private const long MaxSnapshotBytes = 256L * 1024 * 1024;
-    private const long MaxSingleRegionBytes = 64L * 1024 * 1024;
+    private const uint MemPrivate = 0x20000;
+    private const long MaxSnapshotBytes = 512L * 1024 * 1024;
+    private const long MaxSliceBytes = 64L * 1024 * 1024;
+    private const long PriorityRadiusBytes = 4L * 1024 * 1024 * 1024;
     private const int ChunkSize = 1024 * 1024;
     private const int MaxCandidatesPerType = 5000;
 
     private readonly ProcessMemory _memory;
     private readonly List<SnapshotRegion> _baseline = new();
     private readonly Dictionary<string, DiscoveryResult> _results = new(StringComparer.OrdinalIgnoreCase);
+    private readonly List<long> _priorityAddresses = new();
 
     public MemoryDiscoveryScanner(ProcessMemory memory)
     {
@@ -25,6 +28,13 @@ public sealed class MemoryDiscoveryScanner
     public int CapturedRegions => _baseline.Count;
 
     public IReadOnlyDictionary<string, DiscoveryResult> Results => _results;
+
+    public void SetPriorityAddresses(IEnumerable<nint> addresses)
+    {
+        _priorityAddresses.Clear();
+        foreach (var address in addresses.Select(a => a.ToInt64()).Where(a => a >= 0x10000).Distinct().Take(32))
+            _priorityAddresses.Add(address);
+    }
 
     public Task CaptureBaselineAsync(string nextStep, CancellationToken cancellationToken = default)
         => Task.Run(() => CaptureBaseline(nextStep, cancellationToken), cancellationToken);
@@ -44,34 +54,107 @@ public sealed class MemoryDiscoveryScanner
         CapturedBytes = 0;
         Status = $"Capturando memória base para {nextStep}...";
 
-        var regions = _memory.GetReadableRegions(writableOnly: true)
-            .Where(r => r.Size > 0 && r.Size <= MaxSingleRegionBytes)
-            .OrderBy(r => r.BaseAddress.ToInt64())
+        var privateRegions = _memory.GetReadableRegions(writableOnly: true)
+            .Where(r => r.Size >= 4096 && r.Type == MemPrivate)
             .ToArray();
 
-        foreach (var region in regions)
+        if (privateRegions.Length == 0)
+            privateRegions = _memory.GetReadableRegions(writableOnly: true)
+                .Where(r => r.Size >= 4096)
+                .ToArray();
+
+        var slices = new List<RegionSlice>();
+        foreach (var region in privateRegions)
+        {
+            foreach (var slice in SplitRegion(region))
+            {
+                var distance = DistanceToPriority(slice.BaseAddress.ToInt64(), slice.Length);
+
+                if (_priorityAddresses.Count > 0 && distance > PriorityRadiusBytes)
+                    continue;
+
+                // Sem âncoras, evita repetir o erro da v0.2.7 de consumir o orçamento
+                // inteiro em mapeamentos baixos antes de chegar ao heap 64-bit do jogo.
+                if (_priorityAddresses.Count == 0 && slice.BaseAddress.ToInt64() < 0x1_0000_0000L)
+                    continue;
+
+                slices.Add(slice with { PriorityDistance = distance });
+            }
+        }
+
+        if (slices.Count == 0)
+        {
+            foreach (var region in privateRegions)
+            {
+                foreach (var slice in SplitRegion(region))
+                    slices.Add(slice with { PriorityDistance = DistanceToPriority(slice.BaseAddress.ToInt64(), slice.Length) });
+            }
+        }
+
+        var ordered = slices
+            .OrderBy(s => s.PriorityDistance)
+            .ThenByDescending(s => s.Length)
+            .ThenBy(s => s.BaseAddress.ToInt64())
+            .ToArray();
+
+        foreach (var slice in ordered)
         {
             cancellationToken.ThrowIfCancellationRequested();
             if (CapturedBytes >= MaxSnapshotBytes)
                 break;
 
             var remainingBudget = MaxSnapshotBytes - CapturedBytes;
-            var length = (int)Math.Min(region.Size, remainingBudget);
+            var length = (int)Math.Min(slice.Length, remainingBudget);
             if (length < 4096)
                 continue;
 
-            var bytes = ReadRegionBestEffort(region.BaseAddress, length, cancellationToken);
+            var bytes = ReadRegionBestEffort(slice.BaseAddress, length, cancellationToken);
             if (bytes is null || bytes.Length < 4096)
                 continue;
 
-            _baseline.Add(new SnapshotRegion(region.BaseAddress, bytes));
+            _baseline.Add(new SnapshotRegion(slice.BaseAddress, bytes));
             CapturedBytes += bytes.Length;
         }
 
         if (_baseline.Count == 0)
-            throw new InvalidOperationException("Nenhuma região de memória gravável pôde ser capturada.");
+            throw new InvalidOperationException("Nenhuma região de memória privada/gravável pôde ser capturada.");
 
-        Status = $"Base capturada para {nextStep}: {_baseline.Count} regiões, {FormatBytes(CapturedBytes)}.";
+        Status = $"Base capturada para {nextStep}: {_baseline.Count} blocos, {FormatBytes(CapturedBytes)}.";
+    }
+
+    private IEnumerable<RegionSlice> SplitRegion(MemoryRegionInfo region)
+    {
+        var offset = 0L;
+        while (offset < region.Size)
+        {
+            var length = Math.Min(MaxSliceBytes, region.Size - offset);
+            yield return new RegionSlice(region.BaseAddress + offset, length, long.MaxValue);
+            offset += length;
+        }
+    }
+
+    private long DistanceToPriority(long baseAddress, long length)
+    {
+        if (_priorityAddresses.Count == 0)
+            return long.MaxValue / 4;
+
+        var end = baseAddress + length;
+        var best = long.MaxValue;
+        foreach (var anchor in _priorityAddresses)
+        {
+            long distance;
+            if (anchor >= baseAddress && anchor < end)
+                distance = 0;
+            else if (anchor < baseAddress)
+                distance = baseAddress - anchor;
+            else
+                distance = anchor - end;
+
+            if (distance < best)
+                best = distance;
+        }
+
+        return best;
     }
 
     private DiscoveryResult CompareAgainstBaseline(
@@ -215,8 +298,6 @@ public sealed class MemoryDiscoveryScanner
         var scale = Math.Max(Math.Abs(before), 1.0);
         var relative = Math.Min(delta / scale, 10.0);
 
-        // Dá preferência a valores com magnitude típica de recursos de jogo,
-        // mas sem descartar representações escaladas (ex.: x1000).
         var magnitudeBonus = before switch
         {
             >= 1 and <= 100_000 => 2.0,
@@ -224,7 +305,11 @@ public sealed class MemoryDiscoveryScanner
             _ => 0.0
         };
 
-        return relative * 10.0 + magnitudeBonus;
+        // A v0.2.7 ficou dominada por regiões transitórias que simplesmente zeraram.
+        // Não removemos zero (um recurso pode realmente acabar), mas reduzimos sua prioridade.
+        var zeroPenalty = after == 0 ? 4.0 : 0.0;
+
+        return relative * 10.0 + magnitudeBonus - zeroPenalty;
     }
 
     private static void AddBounded(List<MemoryCandidate> list, MemoryCandidate candidate)
@@ -256,9 +341,12 @@ public sealed class MemoryDiscoveryScanner
     public string BuildReport(string gameVersion)
     {
         var sb = new StringBuilder();
-        sb.AppendLine("Game Trainer v0.2.7 - Memory Discovery");
+        sb.AppendLine("Game Trainer v0.2.8 - Heap Focused Memory Discovery");
         sb.AppendLine($"Jogo: CrimsonDesert.exe | versão {gameVersion}");
-        sb.AppendLine($"Snapshot: {CapturedRegions} regiões / {FormatBytes(CapturedBytes)}");
+        sb.AppendLine($"Snapshot: {CapturedRegions} blocos / {FormatBytes(CapturedBytes)}");
+        sb.AppendLine($"Âncoras dinâmicas priorizadas: {_priorityAddresses.Count}");
+        if (_priorityAddresses.Count > 0)
+            sb.AppendLine("Âncoras: " + string.Join(", ", _priorityAddresses.Take(12).Select(a => $"0x{a:X}")));
         sb.AppendLine("Modo: somente leitura durante descoberta");
         sb.AppendLine();
 
@@ -272,10 +360,72 @@ public sealed class MemoryDiscoveryScanner
             sb.AppendLine();
         }
 
+        AppendStructuralCorrelation(sb);
+
         if (_results.Count == 0)
             sb.AppendLine("Nenhuma etapa de alteração foi registrada.");
 
         return sb.ToString();
+    }
+
+    private void AppendStructuralCorrelation(StringBuilder sb)
+    {
+        if (!_results.TryGetValue("VIDA", out var hp)
+            || !_results.TryGetValue("VIGOR", out var stamina)
+            || !_results.TryGetValue("ESPÍRITO", out var spirit))
+            return;
+
+        sb.AppendLine("=== CORRELAÇÃO ESTRUTURAL ===");
+        sb.AppendLine("Procura tripletas com os espaçamentos públicos HP→Vigor/Espírito do Crimson Desert.");
+
+        var matches = new List<StructuralMatch>();
+        AddStructuralMatches(matches, "Int64", hp.Int64Candidates, stamina.Int64Candidates, spirit.Int64Candidates);
+        AddStructuralMatches(matches, "Int32", hp.Int32Candidates, stamina.Int32Candidates, spirit.Int32Candidates);
+        AddStructuralMatches(matches, "Float", hp.FloatCandidates, stamina.FloatCandidates, spirit.FloatCandidates);
+
+        foreach (var match in matches.OrderByDescending(m => m.Score).Take(30))
+        {
+            sb.AppendLine($"  {match.Type}/{match.Layout}: HP 0x{match.Health:X} | Vigor 0x{match.Stamina:X} | Espírito 0x{match.Spirit:X} | score {match.Score:F3}");
+        }
+
+        if (matches.Count == 0)
+            sb.AppendLine("  Nenhuma tripla exata encontrada nos candidatos retidos.");
+
+        sb.AppendLine();
+    }
+
+    private static void AddStructuralMatches(
+        List<StructuralMatch> output,
+        string type,
+        IReadOnlyList<MemoryCandidate> hp,
+        IReadOnlyList<MemoryCandidate> stamina,
+        IReadOnlyList<MemoryCandidate> spirit)
+    {
+        var staminaMap = stamina.ToDictionary(c => c.Address.ToInt64(), c => c);
+        var spiritMap = spirit.ToDictionary(c => c.Address.ToInt64(), c => c);
+
+        foreach (var h in hp)
+        {
+            AddLayout("mai-2026", 0x510, 0x5A0);
+            AddLayout("legado", 0x480, 0x510);
+
+            void AddLayout(string layout, long staminaDelta, long spiritDelta)
+            {
+                var hAddress = h.Address.ToInt64();
+                if (!staminaMap.TryGetValue(hAddress + staminaDelta, out var s))
+                    return;
+                if (!spiritMap.TryGetValue(hAddress + spiritDelta, out var p))
+                    return;
+
+                output.Add(new StructuralMatch(
+                    type,
+                    layout,
+                    hAddress,
+                    s.Address.ToInt64(),
+                    p.Address.ToInt64(),
+                    h.Score + s.Score + p.Score));
+            }
+        }
     }
 
     private static void AppendCandidates(StringBuilder sb, string type, IReadOnlyList<MemoryCandidate> candidates)
@@ -301,6 +451,8 @@ public sealed class MemoryDiscoveryScanner
     }
 
     private sealed record SnapshotRegion(nint BaseAddress, byte[] Bytes);
+    private readonly record struct RegionSlice(nint BaseAddress, long Length, long PriorityDistance);
+    private readonly record struct StructuralMatch(string Type, string Layout, long Health, long Stamina, long Spirit, double Score);
 }
 
 public enum ChangeDirection
