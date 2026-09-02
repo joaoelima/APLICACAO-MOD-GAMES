@@ -67,7 +67,10 @@ public partial class MainWindow : Window
             if (process is null)
             {
                 if (_memory.IsAttached)
+                {
+                    _module.Detach();
                     _memory.Detach();
+                }
 
                 _attachedProcessId = null;
                 GameStatusText.Text = "Aguardando o Crimson Desert ser iniciado...";
@@ -82,10 +85,16 @@ public partial class MainWindow : Window
 
             if (_attachedProcessId != process.Id || !_memory.IsAttached)
             {
+                if (_memory.IsAttached)
+                {
+                    _module.Detach();
+                    _memory.Detach();
+                }
+
                 _memory.Attach(process);
                 _attachedProcessId = process.Id;
 
-                TrainerStatusText.Text = "Jogo detectado. Localizando jogador e atributos automaticamente...";
+                TrainerStatusText.Text = "Jogo detectado. Capturando o jogador atual pela rotina do jogo...";
                 StatusBadge.Text = "ANALISANDO";
 
                 await Task.Run(() => _module.AttachAsync(_memory));
@@ -279,6 +288,7 @@ public partial class MainWindow : Window
         _isClosing = true;
         _processTimer.Stop();
         _trainerTimer.Stop();
+        _module.Detach();
         _memory.Dispose();
         base.OnClosed(e);
     }
