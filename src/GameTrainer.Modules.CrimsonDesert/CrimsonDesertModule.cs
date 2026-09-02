@@ -7,53 +7,65 @@ namespace GameTrainer.Modules.CrimsonDesert;
 public sealed class CrimsonDesertModule : IGameModule
 {
     // ---------------------------------------------------------------------
-    // Crimson Desert - layouts conhecidos
+    // Crimson Desert - resolução externa de atributos
     // ---------------------------------------------------------------------
-    // Layout atual (bbfox CT, atualização 2026-08-01):
-    // ServerUserActor -> char slot -> +68 -> +20 -> +18 -> +58 -> +0
-    // HP:     current +08 / max +18
-    // Stamina current +6C8 / max +6D8
-    // Spirit  current +758 / max +768
-    // Todos como DWORD. A tabela pública repõe current = max * 10.
+    // Referências públicas cruzadas (CrimsonDesertCoop / bbfox CT):
+    // WorldSystem -> ActorManager (+0x30) -> UserActor (+0x28)
+    // UserActor +0x58 -> Stats Component
+    //
+    // StatEntry:
+    // +0x00 int32  type (0=HP, 17=Stamina, 18=Spirit)
+    // +0x08 int64  current
+    // +0x18 int64  max
+    //
+    // Layout atual documentado em maio/2026:
+    // HP entry      = stats + 0x000
+    // Stamina entry = stats + 0x510
+    // Spirit entry  = stats + 0x5A0
+    //
+    // Layout legado:
+    // Stamina entry = stats + 0x480
+    // Spirit entry  = stats + 0x510
     // ---------------------------------------------------------------------
-    private const int CurrentHpOffset2026 = 0x08;
-    private const int MaxHpOffset2026 = 0x18;
-    private const int CurrentStaminaOffset2026 = 0x6C8;
-    private const int MaxStaminaOffset2026 = 0x6D8;
-    private const int CurrentSpiritOffset2026 = 0x758;
-    private const int MaxSpiritOffset2026 = 0x768;
-    private const int CurrentValueScale2026 = 10;
 
-    // Character slots vistos na tabela atual.
-    private static readonly int[] CurrentCharacterSlots = { 0xD0, 0xD8, 0xE0 };
-
-    // Layout legado: StatEntry com id + current/max em Int64.
     private const int HealthId = 0;
     private const int StaminaId = 17;
     private const int SpiritId = 18;
-    private const int LegacyCurrentValueOffset = 0x08;
-    private const int LegacyMaxValueOffset = 0x18;
-    private static readonly LegacyStatLayout[] LegacyLayouts =
+
+    private const int StatTypeOffset = 0x00;
+    private const int StatCurrentOffset = 0x08;
+    private const int StatMaxOffset = 0x18;
+
+    private static readonly StatLayout[] StatLayouts =
     {
-        new(0x510, 0x5A0, "legado-mai-2026"),
-        new(0x480, 0x510, "legado-v1.01")
+        new(0x510, 0x5A0, "Int64-mai-2026"),
+        new(0x480, 0x510, "Int64-legado-v1.01")
     };
 
-    // AOB do fluxo de "Get current char pointer" publicado em 2026-08-01.
-    // Aqui ele serve apenas como confirmação da família da build; não fazemos
-    // injeção/hook para capturar RBX.
-    private const string CurrentPlayerDataPattern =
-        "48 8B 53 08 48 8D 4C 24 78 E8 ? ? ? ? 90 48 8B 43 68 48 8B 88 A0 01 00 00 48 8B 41 38 0F B7 48 20";
-
     private const int StaticPlayerBaseRva = 0x05CC7618;
+
     private const string PlayerBaseDiscoveryPattern =
         "48 8B 0D ? ? ? ? E8 ? ? ? ? 41 B0 01 48 8B 53 08 48 8D 4C 24 40";
+
+    private const string CurrentPlayerPattern =
+        "48 8B 53 08 48 8D 4C 24 78 E8 ? ? ? ? 90 48 8B 43 68 48 8B 88 A0 01 00 00 48 8B 41 38 0F B7 48 20";
+
+    private const string ChildActorPattern =
+        "48 8B 47 68 48 8B 88 38 01 00 00 80";
 
     private static readonly WorldSystemPattern[] WorldSystemPatterns =
     {
         new("P1", "48 83 EC 28 48 8B 0D ? ? ? ? 48 8B 49 ? E8 ? ? ? ? 84 C0 0F 94 C0 48 83 C4 28 C3", 7, 11),
         new("P2", "80 B8 ? ? ? ? 00 75 ? 48 8B 05 ? ? ? ? 48 8B 88 ? ? ? ?", 12, 16),
         new("P3", "48 8B 0D ? ? ? ? 48 8B 49 ? E8 ? ? ? ? 84 C0 0F 94 C0", 3, 7)
+    };
+
+    private static readonly int[] PlayerBaseCharacterSlots =
+    {
+        0x68,  // Kliff / personagem principal nas tabelas públicas
+        0xE0,
+        0x168,
+        0x268
     };
 
     private ProcessMemory? _memory;
@@ -63,8 +75,6 @@ public sealed class CrimsonDesertModule : IGameModule
     private bool _infiniteHealth;
     private bool _infiniteStamina;
     private bool _infiniteSpirit;
-    private bool _oneHitKill;
-    private int? _originalAttack;
 
     public string LastError { get; private set; } = string.Empty;
     public string RuntimeStatus { get; private set; } = "Aguardando o jogo";
@@ -115,7 +125,7 @@ public sealed class CrimsonDesertModule : IGameModule
                     {
                         Id = "one-hit-kill",
                         Name = "Super Dano / Mortes com Um Golpe",
-                        Description = "Eleva temporariamente o atributo de ataque do personagem. Recurso experimental.",
+                        Description = "Aguardando validação segura do atributo de ataque nesta build.",
                         Type = TrainerFeatureType.Toggle
                     }
                 }
@@ -127,7 +137,6 @@ public sealed class CrimsonDesertModule : IGameModule
     {
         _memory = processMemory;
         _runtime = new PlayerRuntime();
-        _originalAttack = null;
         LastError = string.Empty;
         DiagnosticReport = "Iniciando diagnóstico da memória do Crimson Desert...";
         ResolveRuntime(force: true);
@@ -144,7 +153,6 @@ public sealed class CrimsonDesertModule : IGameModule
             return Task.FromResult(false);
         }
 
-        RestoreOriginalAttack();
         _runtime = new PlayerRuntime();
         _nextResolveAttemptUtc = DateTime.MinValue;
         return Task.FromResult(ResolveRuntime(force: true));
@@ -158,6 +166,14 @@ public sealed class CrimsonDesertModule : IGameModule
             return Task.FromResult(false);
         }
 
+        if (featureId == "one-hit-kill")
+        {
+            LastError = enabled
+                ? "Super Dano permanece desativado até validarmos o bloco de ataque desta build."
+                : string.Empty;
+            return Task.FromResult(!enabled);
+        }
+
         if (enabled && !EnsureRuntime())
             return Task.FromResult(false);
 
@@ -166,7 +182,6 @@ public sealed class CrimsonDesertModule : IGameModule
             "infinite-health" => SetFlag(ref _infiniteHealth, enabled),
             "infinite-stamina" => SetFlag(ref _infiniteStamina, enabled),
             "infinite-spirit" => SetFlag(ref _infiniteSpirit, enabled),
-            "one-hit-kill" => SetOneHitKill(enabled),
             _ => false
         };
 
@@ -184,7 +199,7 @@ public sealed class CrimsonDesertModule : IGameModule
         if (_memory is null || !_memory.IsAttached)
             return Task.CompletedTask;
 
-        if (!_infiniteHealth && !_infiniteStamina && !_infiniteSpirit && !_oneHitKill)
+        if (!_infiniteHealth && !_infiniteStamina && !_infiniteSpirit)
             return Task.CompletedTask;
 
         if (!EnsureRuntime())
@@ -192,27 +207,12 @@ public sealed class CrimsonDesertModule : IGameModule
 
         try
         {
-            if (_runtime.Format == StatFormat.CurrentDword2026)
-            {
-                if (_infiniteHealth)
-                    RestoreCurrentDwordStat(_runtime.HealthCurrent, _runtime.HealthMax, "Vida");
-                if (_infiniteStamina)
-                    RestoreCurrentDwordStat(_runtime.StaminaCurrent, _runtime.StaminaMax, "Vigor");
-                if (_infiniteSpirit)
-                    RestoreCurrentDwordStat(_runtime.SpiritCurrent, _runtime.SpiritMax, "Espírito");
-            }
-            else
-            {
-                if (_infiniteHealth)
-                    RestoreLegacyStat(_runtime.HealthEntry, HealthId);
-                if (_infiniteStamina)
-                    RestoreLegacyStat(_runtime.StaminaEntry, StaminaId);
-                if (_infiniteSpirit)
-                    RestoreLegacyStat(_runtime.SpiritEntry, SpiritId);
-            }
-
-            if (_oneHitKill)
-                ApplySuperDamage();
+            if (_infiniteHealth)
+                RestoreStat(_runtime.HealthEntry, HealthId, "Vida");
+            if (_infiniteStamina)
+                RestoreStat(_runtime.StaminaEntry, StaminaId, "Vigor");
+            if (_infiniteSpirit)
+                RestoreStat(_runtime.SpiritEntry, SpiritId, "Espírito");
         }
         catch
         {
@@ -229,9 +229,6 @@ public sealed class CrimsonDesertModule : IGameModule
         return true;
     }
 
-    // ---------------------------------------------------------------------
-    // Runtime resolution
-    // ---------------------------------------------------------------------
     private bool EnsureRuntime()
     {
         if (_runtime.IsResolved && ValidateRuntime())
@@ -252,15 +249,15 @@ public sealed class CrimsonDesertModule : IGameModule
 
         var diagnostics = new List<string>
         {
-            "Diagnóstico v0.2.4",
+            "Diagnóstico v0.2.5",
             $"Módulo: 0x{_memory.MainModuleBase.ToInt64():X} / 0x{_memory.MainModuleSize:X} bytes",
-            "Layout prioritário: tabela pública 2026-08-01 (DWORD / HP+08, STA+6C8, SPI+758)"
+            "Estratégia: WorldSystem -> UserActor -> +0x58 Stats Component (StatEntry Int64)",
+            "Layout prioritário: HP +08/+18, STA +518/+528, SPI +5A8/+5B8"
         };
 
-        var currentAob = _memory.FindPatternInMainModule(CurrentPlayerDataPattern);
-        diagnostics.Add(currentAob.HasValue
-            ? $"AOB CurrentPlayer 2026-08-01: encontrado em 0x{currentAob.Value.ToInt64():X}"
-            : "AOB CurrentPlayer 2026-08-01: não encontrado");
+        AddAobDiagnostic(diagnostics, "CurrentPlayer", CurrentPlayerPattern);
+        AddAobDiagnostic(diagnostics, "PlayerBaseDiscovery", PlayerBaseDiscoveryPattern);
+        AddAobDiagnostic(diagnostics, "ChildActor", ChildActorPattern);
 
         try
         {
@@ -278,11 +275,15 @@ public sealed class CrimsonDesertModule : IGameModule
                     pattern.DisplacementOffset,
                     pattern.InstructionEndOffset);
 
+                diagnostics.Add($"WorldSystem {pattern.Name}: match=0x{match.Value.ToInt64():X}, slot=0x{globalSlot.ToInt64():X}");
+
                 if (!_memory.TryReadPointer(globalSlot, out var worldSystem))
                 {
-                    diagnostics.Add($"WorldSystem {pattern.Name}: ponteiro RIP inválido");
+                    diagnostics.Add($"WorldSystem {pattern.Name}: ponteiro global inválido");
                     continue;
                 }
+
+                diagnostics.Add($"WorldSystem {pattern.Name}: WorldSystem=0x{worldSystem.ToInt64():X} ({DescribeAddress(worldSystem)})");
 
                 if (!_memory.TryReadPointer(worldSystem + 0x30, out var actorManager))
                 {
@@ -290,40 +291,48 @@ public sealed class CrimsonDesertModule : IGameModule
                     continue;
                 }
 
+                diagnostics.Add($"WorldSystem {pattern.Name}: ActorManager=0x{actorManager.ToInt64():X} ({DescribeAddress(actorManager)})");
+
                 if (!_memory.TryReadPointer(actorManager + 0x28, out var actor))
                 {
                     diagnostics.Add($"WorldSystem {pattern.Name}: UserActor +0x28 inválido");
                     continue;
                 }
 
-                diagnostics.Add($"WorldSystem {pattern.Name}: Actor 0x{actor.ToInt64():X}");
+                diagnostics.Add($"WorldSystem {pattern.Name}: UserActor=0x{actor.ToInt64():X} ({DescribeAddress(actor)})");
+                diagnostics.Add($"WorldSystem {pattern.Name}: {DescribeActor(actor)}");
 
-                // Primeiro tenta exatamente a cadeia da tabela atual.
-                if (TryResolveCurrent2026FromServerUserActor(actor, out var currentRuntime, out var currentDetail))
+                if (TryResolveDirectStats(actor, out var directRuntime, out var directDetail))
                 {
-                    currentRuntime.WorldSystem = worldSystem;
-                    currentRuntime.ActorManager = actorManager;
-                    currentRuntime.Actor = actor;
-                    CompleteSuccessfulResolution(currentRuntime, $"WorldSystem {pattern.Name}", diagnostics, currentDetail);
+                    directRuntime.WorldSystem = worldSystem;
+                    directRuntime.ActorManager = actorManager;
+                    directRuntime.Actor = actor;
+                    CompleteSuccessfulResolution(
+                        directRuntime,
+                        $"WorldSystem {pattern.Name} -> Actor+58",
+                        diagnostics,
+                        directDetail);
                     return true;
                 }
 
-                diagnostics.Add($"WorldSystem {pattern.Name}: layout 2026 -> {currentDetail}");
+                diagnostics.Add($"WorldSystem {pattern.Name}: Actor+58 -> {directDetail}");
 
-                // Fallback: estrutura antiga actor->marker->root.
-                if (TryResolveLegacyFromActor(actor, out var legacyRuntime, out var legacyDetail))
+                if (TryResolveViaMarker(actor, out var markerRuntime, out var markerDetail))
                 {
-                    legacyRuntime.WorldSystem = worldSystem;
-                    legacyRuntime.ActorManager = actorManager;
-                    legacyRuntime.Actor = actor;
-                    CompleteSuccessfulResolution(legacyRuntime, $"WorldSystem {pattern.Name} legado", diagnostics, legacyDetail);
+                    markerRuntime.WorldSystem = worldSystem;
+                    markerRuntime.ActorManager = actorManager;
+                    markerRuntime.Actor = actor;
+                    CompleteSuccessfulResolution(
+                        markerRuntime,
+                        $"WorldSystem {pattern.Name} -> Marker",
+                        diagnostics,
+                        markerDetail);
                     return true;
                 }
 
-                diagnostics.Add($"WorldSystem {pattern.Name}: legado -> {legacyDetail}");
+                diagnostics.Add($"WorldSystem {pattern.Name}: Marker -> {markerDetail}");
             }
 
-            // Mantém os caminhos antigos como última tentativa.
             if (TryResolveViaPlayerBaseAob(out var aobRuntime, out var aobDetail))
             {
                 CompleteSuccessfulResolution(aobRuntime, "PlayerBase AOB", diagnostics, aobDetail);
@@ -340,7 +349,7 @@ public sealed class CrimsonDesertModule : IGameModule
 
             DiagnosticReport = string.Join(Environment.NewLine, diagnostics);
             InvalidateRuntime(
-                "Actor localizado, mas a cadeia de atributos da build ainda não validou. Use “Copiar diagnóstico”.",
+                "O UserActor foi localizado, mas o Stats Component desta build ainda não validou. Use “Copiar diagnóstico”.",
                 scheduleRetry: false,
                 preserveDiagnostic: true);
             return false;
@@ -357,13 +366,20 @@ public sealed class CrimsonDesertModule : IGameModule
         }
     }
 
-    private bool TryResolveCurrent2026FromServerUserActor(
-        nint serverUserActor,
-        out PlayerRuntime runtime,
-        out string detail)
+    private void AddAobDiagnostic(List<string> diagnostics, string name, string pattern)
+    {
+        if (_memory is null)
+            return;
+
+        var match = _memory.FindPatternInMainModule(pattern);
+        diagnostics.Add(match.HasValue
+            ? $"AOB {name}: 0x{match.Value.ToInt64():X} (RVA 0x{match.Value.ToInt64() - _memory.MainModuleBase.ToInt64():X})"
+            : $"AOB {name}: não encontrado");
+    }
+
+    private bool TryResolveDirectStats(nint actor, out PlayerRuntime runtime, out string detail)
     {
         runtime = new PlayerRuntime();
-        detail = string.Empty;
 
         if (_memory is null)
         {
@@ -371,146 +387,18 @@ public sealed class CrimsonDesertModule : IGameModule
             return false;
         }
 
-        var attempts = new List<string>();
-
-        foreach (var slot in CurrentCharacterSlots)
+        if (!_memory.TryReadPointer(actor + 0x58, out var statsBase))
         {
-            // Tabela atual:
-            // ServerUserActor + slot -> +68 -> +20 -> +18 -> +58 -> +0
-            if (TryResolvePointerChain(
-                    serverUserActor,
-                    new[] { slot, 0x68, 0x20, 0x18, 0x58, 0x00 },
-                    out var statsBase)
-                && TryBuildCurrentRuntime(statsBase, slot, out runtime, out var values))
-            {
-                detail = $"slot +0x{slot:X}, cadeia completa com +0 final; {values}";
-                return true;
-            }
-
-            // Algumas representações do CE deixam o +0 apenas como o endereço final,
-            // sem uma dereferência adicional. Testamos as duas formas e validamos valores.
-            if (TryResolvePointerChain(
-                    serverUserActor,
-                    new[] { slot, 0x68, 0x20, 0x18, 0x58 },
-                    out statsBase)
-                && TryBuildCurrentRuntime(statsBase, slot, out runtime, out values))
-            {
-                detail = $"slot +0x{slot:X}, cadeia sem +0 final; {values}";
-                return true;
-            }
-
-            attempts.Add($"+0x{slot:X}: não validou");
+            detail = "actor+0x58 não contém ponteiro legível";
+            return false;
         }
 
-        detail = string.Join("; ", attempts);
-        return false;
+        return TryBuildRuntimeFromStatsBase(actor, statsBase, out runtime, out detail);
     }
 
-    private bool TryBuildCurrentRuntime(
-        nint statsBase,
-        int characterSlot,
-        out PlayerRuntime runtime,
-        out string values)
+    private bool TryResolveViaMarker(nint actor, out PlayerRuntime runtime, out string detail)
     {
         runtime = new PlayerRuntime();
-        values = string.Empty;
-
-        if (!ValidateCurrentStatsBase(statsBase, out var snapshot))
-            return false;
-
-        runtime.IsResolved = true;
-        runtime.Format = StatFormat.CurrentDword2026;
-        runtime.StatsBase = statsBase;
-        runtime.CharacterSlot = characterSlot;
-
-        runtime.HealthCurrent = statsBase + CurrentHpOffset2026;
-        runtime.HealthMax = statsBase + MaxHpOffset2026;
-        runtime.StaminaCurrent = statsBase + CurrentStaminaOffset2026;
-        runtime.StaminaMax = statsBase + MaxStaminaOffset2026;
-        runtime.SpiritCurrent = statsBase + CurrentSpiritOffset2026;
-        runtime.SpiritMax = statsBase + MaxSpiritOffset2026;
-
-        values = $"StatsBase 0x{statsBase.ToInt64():X}; " +
-                 $"HP {snapshot.HpCurrent}/{snapshot.HpMax}; " +
-                 $"STA {snapshot.StaminaCurrent}/{snapshot.StaminaMax}; " +
-                 $"SPI {snapshot.SpiritCurrent}/{snapshot.SpiritMax}";
-        return true;
-    }
-
-    private bool ValidateCurrentStatsBase(nint statsBase, out CurrentStatsSnapshot snapshot)
-    {
-        snapshot = default;
-        if (_memory is null || statsBase == 0 || !_memory.IsReadable(statsBase, MaxSpiritOffset2026 + sizeof(int)))
-            return false;
-
-        if (!_memory.TryRead<int>(statsBase + CurrentHpOffset2026, out var hpCur)
-            || !_memory.TryRead<int>(statsBase + MaxHpOffset2026, out var hpMax)
-            || !_memory.TryRead<int>(statsBase + CurrentStaminaOffset2026, out var staCur)
-            || !_memory.TryRead<int>(statsBase + MaxStaminaOffset2026, out var staMax)
-            || !_memory.TryRead<int>(statsBase + CurrentSpiritOffset2026, out var spiCur)
-            || !_memory.TryRead<int>(statsBase + MaxSpiritOffset2026, out var spiMax))
-            return false;
-
-        if (!IsPlausibleCurrent2026(hpCur, hpMax)
-            || !IsPlausibleCurrent2026(staCur, staMax)
-            || !IsPlausibleCurrent2026(spiCur, spiMax))
-            return false;
-
-        snapshot = new CurrentStatsSnapshot(hpCur, hpMax, staCur, staMax, spiCur, spiMax);
-        return true;
-    }
-
-    private static bool IsPlausibleCurrent2026(int current, int max)
-    {
-        if (max <= 0 || max > 100_000_000)
-            return false;
-        if (current < 0)
-            return false;
-
-        // A tabela atual usa current = max * 10. Aceitamos folga para buffs.
-        var upperBound = Math.Max((long)max * 30L, (long)max + 10_000L);
-        return current <= upperBound;
-    }
-
-    // ---------------------------------------------------------------------
-    // Reposição de atributos
-    // ---------------------------------------------------------------------
-    private void RestoreCurrentDwordStat(nint currentAddress, nint maxAddress, string label)
-    {
-        if (_memory is null
-            || !_memory.TryRead<int>(maxAddress, out var max)
-            || max <= 0
-            || max > 100_000_000)
-        {
-            InvalidateRuntime($"{label}: valor máximo inválido. Relocalizando...");
-            return;
-        }
-
-        var desired64 = (long)max * CurrentValueScale2026;
-        if (desired64 <= 0 || desired64 > int.MaxValue)
-        {
-            InvalidateRuntime($"{label}: valor calculado fora da faixa segura. Relocalizando...");
-            return;
-        }
-
-        var desired = (int)desired64;
-        if (!_memory.TryRead<int>(currentAddress, out var current))
-        {
-            InvalidateRuntime($"{label}: não foi possível ler o valor atual. Relocalizando...");
-            return;
-        }
-
-        if (current < desired)
-            _memory.Write(currentAddress, desired);
-    }
-
-    // ---------------------------------------------------------------------
-    // Fallback legado
-    // ---------------------------------------------------------------------
-    private bool TryResolveLegacyFromActor(nint actor, out PlayerRuntime runtime, out string detail)
-    {
-        runtime = new PlayerRuntime();
-        detail = string.Empty;
 
         if (_memory is null)
         {
@@ -520,85 +408,188 @@ public sealed class CrimsonDesertModule : IGameModule
 
         if (!_memory.TryReadPointer(actor + 0x20, out var marker))
         {
-            detail = "Marker +0x20 inválido";
+            detail = "actor+0x20 Marker inválido";
             return false;
         }
 
         if (!_memory.TryReadPointer(marker + 0x18, out var root))
         {
-            detail = "Root +0x18 inválido";
+            detail = $"Marker=0x{marker.ToInt64():X}, marker+0x18 Root inválido";
             return false;
         }
 
-        nint healthEntry = 0;
-        if (_memory.TryReadPointer(root + 0x58, out var rooted) && ValidateLegacyStatEntry(rooted, HealthId))
-            healthEntry = rooted;
-        else if (_memory.TryReadPointer(actor + 0x58, out var direct) && ValidateLegacyStatEntry(direct, HealthId))
-            healthEntry = direct;
-        else
+        if (!_memory.TryReadPointer(root + 0x58, out var statsBase))
         {
-            detail = "nenhuma entrada Health/Int64 válida em +0x58";
+            detail = $"Marker=0x{marker.ToInt64():X}, Root=0x{root.ToInt64():X}, root+0x58 inválido";
             return false;
         }
 
-        foreach (var layout in LegacyLayouts)
+        if (!TryBuildRuntimeFromStatsBase(actor, statsBase, out runtime, out var statsDetail))
         {
-            var stamina = healthEntry + layout.StaminaFromHealth;
-            var spirit = healthEntry + layout.SpiritFromHealth;
+            detail = $"Marker=0x{marker.ToInt64():X}, Root=0x{root.ToInt64():X}, Stats=0x{statsBase.ToInt64():X}; {statsDetail}";
+            return false;
+        }
 
-            if (!ValidateLegacyStatEntry(stamina, StaminaId)
-                || !ValidateLegacyStatEntry(spirit, SpiritId))
+        runtime.Marker = marker;
+        runtime.Root = root;
+        detail = $"Marker=0x{marker.ToInt64():X}, Root=0x{root.ToInt64():X}; {statsDetail}";
+        return true;
+    }
+
+    private bool TryBuildRuntimeFromStatsBase(
+        nint actor,
+        nint statsBase,
+        out PlayerRuntime runtime,
+        out string detail)
+    {
+        runtime = new PlayerRuntime();
+
+        foreach (var layout in StatLayouts)
+        {
+            var health = statsBase;
+            var stamina = statsBase + layout.StaminaFromHealth;
+            var spirit = statsBase + layout.SpiritFromHealth;
+
+            if (!ValidateStatEntry(health, HealthId, out var hp)
+                || !ValidateStatEntry(stamina, StaminaId, out var sta)
+                || !ValidateStatEntry(spirit, SpiritId, out var spi))
                 continue;
 
             runtime.IsResolved = true;
-            runtime.Format = StatFormat.LegacyQword;
-            runtime.Marker = marker;
-            runtime.Root = root;
-            runtime.HealthEntry = healthEntry;
+            runtime.Actor = actor;
+            runtime.StatsBase = statsBase;
+            runtime.HealthEntry = health;
             runtime.StaminaEntry = stamina;
             runtime.SpiritEntry = spirit;
             runtime.LayoutName = layout.Name;
-            detail = $"Health 0x{healthEntry.ToInt64():X}; layout {layout.Name}";
+
+            detail = $"Stats=0x{statsBase.ToInt64():X} ({DescribeAddress(statsBase)}); " +
+                     $"HP={FormatStat(hp)}, STA={FormatStat(sta)}, SPI={FormatStat(spi)}; layout={layout.Name}";
             return true;
         }
 
-        detail = "Health legado encontrado, mas Stamina/Spirit não validaram";
+        detail = DescribeStatsBase(statsBase);
         return false;
     }
 
-    private void RestoreLegacyStat(nint entry, int expectedType)
+    private bool ValidateStatEntry(nint entry, int expectedType, out StatSnapshot snapshot)
     {
-        if (_memory is null || !ValidateLegacyStatEntry(entry, expectedType))
-        {
-            InvalidateRuntime("Os atributos legados mudaram. Relocalizando...");
-            return;
-        }
+        snapshot = default;
 
-        var max = _memory.Read<long>(entry + LegacyMaxValueOffset);
-        _memory.Write(entry + LegacyCurrentValueOffset, max);
-    }
-
-    private bool ValidateLegacyStatEntry(nint entry, int expectedType)
-    {
         if (_memory is null || entry == 0 || !_memory.IsReadable(entry, 0x20))
             return false;
 
-        if (!_memory.TryRead<int>(entry, out var type) || type != expectedType)
+        if (!_memory.TryRead<int>(entry + StatTypeOffset, out var type) || type != expectedType)
             return false;
 
-        if (!_memory.TryRead<long>(entry + LegacyCurrentValueOffset, out var current)
-            || !_memory.TryRead<long>(entry + LegacyMaxValueOffset, out var max))
+        if (!_memory.TryRead<long>(entry + StatCurrentOffset, out var current)
+            || !_memory.TryRead<long>(entry + StatMaxOffset, out var max))
             return false;
 
-        return max > 0
-               && max < 10_000_000_000_000L
-               && current >= 0
-               && current <= max * 8;
+        if (!IsPlausibleStat(current, max, expectedType == HealthId))
+            return false;
+
+        snapshot = new StatSnapshot(type, current, max);
+        return true;
     }
 
-    // ---------------------------------------------------------------------
-    // PlayerBase fallbacks
-    // ---------------------------------------------------------------------
+    private static bool IsPlausibleStat(long current, long max, bool requirePositiveMax)
+    {
+        if (max < 0 || max > 10_000_000_000_000L)
+            return false;
+
+        if (requirePositiveMax && max == 0)
+            return false;
+
+        if (current < 0 || current > 100_000_000_000_000L)
+            return false;
+
+        if (max == 0)
+            return current == 0;
+
+        var upper = Math.Min(100_000_000_000_000L, max * 20L);
+        return current <= upper;
+    }
+
+    private string DescribeStatsBase(nint statsBase)
+    {
+        if (_memory is null)
+            return "memória indisponível";
+
+        var parts = new List<string>
+        {
+            $"Stats candidato=0x{statsBase.ToInt64():X} ({DescribeAddress(statsBase)})"
+        };
+
+        DescribeRawEntry(parts, "HP@+000", statsBase + 0x000);
+        DescribeRawEntry(parts, "STA@+510", statsBase + 0x510);
+        DescribeRawEntry(parts, "SPI@+5A0", statsBase + 0x5A0);
+        DescribeRawEntry(parts, "STA-leg@+480", statsBase + 0x480);
+        DescribeRawEntry(parts, "SPI-leg@+510", statsBase + 0x510);
+
+        return string.Join("; ", parts);
+    }
+
+    private void DescribeRawEntry(List<string> parts, string label, nint entry)
+    {
+        if (_memory is null || !_memory.IsReadable(entry, 0x20))
+        {
+            parts.Add($"{label}=ilegível");
+            return;
+        }
+
+        var hasType = _memory.TryRead<int>(entry, out var type);
+        var hasCurrent = _memory.TryRead<long>(entry + 0x08, out var current);
+        var hasMax = _memory.TryRead<long>(entry + 0x18, out var max);
+
+        parts.Add($"{label}[type={(hasType ? type.ToString() : "?")}, cur={(hasCurrent ? current.ToString() : "?")}, max={(hasMax ? max.ToString() : "?")}] ");
+    }
+
+    private string DescribeActor(nint actor)
+    {
+        if (_memory is null)
+            return "Actor: memória indisponível";
+
+        var parts = new List<string>();
+
+        if (_memory.TryReadPointer(actor, out var vtable))
+            parts.Add($"vtable=0x{vtable.ToInt64():X} ({DescribeAddress(vtable)})");
+        else
+            parts.Add("vtable=inválida");
+
+        if (_memory.TryReadPointer(actor + 0x20, out var marker))
+            parts.Add($"+20=0x{marker.ToInt64():X} ({DescribeAddress(marker)})");
+        else
+            parts.Add("+20=inválido");
+
+        if (_memory.TryReadPointer(actor + 0x40, out var inner))
+            parts.Add($"+40=0x{inner.ToInt64():X} ({DescribeAddress(inner)})");
+        else
+            parts.Add("+40=inválido");
+
+        if (_memory.TryReadPointer(actor + 0x58, out var stats))
+            parts.Add($"+58=0x{stats.ToInt64():X} ({DescribeAddress(stats)})");
+        else
+            parts.Add("+58=inválido");
+
+        return "Actor probe: " + string.Join(", ", parts);
+    }
+
+    private string DescribeAddress(nint address)
+    {
+        if (_memory is null || address == 0)
+            return "nulo";
+
+        var value = address.ToInt64();
+        var start = _memory.MainModuleBase.ToInt64();
+        var end = start + _memory.MainModuleSize;
+
+        if (value >= start && value < end)
+            return $"módulo+0x{value - start:X}";
+
+        return "memória dinâmica";
+    }
+
     private bool TryResolveViaPlayerBaseAob(out PlayerRuntime runtime, out string detail)
     {
         runtime = new PlayerRuntime();
@@ -620,11 +611,11 @@ public sealed class CrimsonDesertModule : IGameModule
         var storage = _memory.ResolveRipRelative(match.Value, 3, 7);
         if (!_memory.TryReadPointer(storage, out var playerBase))
         {
-            detail = "storage/base inválido";
+            detail = $"storage=0x{storage.ToInt64():X}, ponteiro base inválido";
             return false;
         }
 
-        return TryResolveKnownPlayerBase(playerBase, out runtime, out detail);
+        return TryResolveFromKnownPlayerBase(playerBase, out runtime, out detail);
     }
 
     private bool TryResolveViaStaticPlayerBase(out PlayerRuntime runtime, out string detail)
@@ -645,42 +636,40 @@ public sealed class CrimsonDesertModule : IGameModule
             return false;
         }
 
-        return TryResolveKnownPlayerBase(playerBase, out runtime, out detail);
+        return TryResolveFromKnownPlayerBase(playerBase, out runtime, out detail);
     }
 
-    private bool TryResolveKnownPlayerBase(nint playerBase, out PlayerRuntime runtime, out string detail)
+    private bool TryResolveFromKnownPlayerBase(nint playerBase, out PlayerRuntime runtime, out string detail)
     {
         runtime = new PlayerRuntime();
-        detail = string.Empty;
+        var attempts = new List<string>();
 
-        // Caminho antigo: base +18 -> +A0 -> +D0 -> slot.
-        foreach (var slot in new[] { 0x68, 0xE0, 0x168, 0x268 })
+        foreach (var slot in PlayerBaseCharacterSlots)
         {
             if (!TryResolvePointerChain(playerBase, new[] { 0x18, 0xA0, 0xD0, slot }, out var actor))
+            {
+                attempts.Add($"slot +0x{slot:X}: cadeia inválida");
                 continue;
+            }
 
-            if (TryResolveCurrent2026FromServerUserActor(actor, out runtime, out var currentDetail))
+            if (TryResolveDirectStats(actor, out runtime, out var directDetail))
             {
                 runtime.Actor = actor;
-                detail = $"base antiga -> actor + slot 0x{slot:X}; {currentDetail}";
+                detail = $"PlayerBase=0x{playerBase.ToInt64():X}, slot=+0x{slot:X}, Actor=0x{actor.ToInt64():X}; {directDetail}";
                 return true;
             }
 
-            if (TryResolveLegacyFromActor(actor, out runtime, out var legacyDetail))
-            {
-                runtime.Actor = actor;
-                detail = $"base antiga -> actor + slot 0x{slot:X}; {legacyDetail}";
-                return true;
-            }
+            attempts.Add($"slot +0x{slot:X}: Actor=0x{actor.ToInt64():X}; {directDetail}");
         }
 
-        detail = "base encontrada, mas nenhuma cadeia conhecida validou";
+        detail = $"PlayerBase=0x{playerBase.ToInt64():X}; " + string.Join(" | ", attempts);
         return false;
     }
 
     private bool TryResolvePointerChain(nint baseAddress, IReadOnlyList<int> offsets, out nint value)
     {
         value = baseAddress;
+
         if (_memory is null || value == 0)
             return false;
 
@@ -693,117 +682,27 @@ public sealed class CrimsonDesertModule : IGameModule
         return value != 0;
     }
 
-    // ---------------------------------------------------------------------
-    // Super dano - permanece experimental
-    // ---------------------------------------------------------------------
-    private bool SetOneHitKill(bool enabled)
+    private void RestoreStat(nint entry, int expectedType, string label)
     {
-        if (!enabled)
+        if (_memory is null || !ValidateStatEntry(entry, expectedType, out var stat))
         {
-            _oneHitKill = false;
-            RestoreOriginalAttack();
-            LastError = string.Empty;
-            return true;
-        }
-
-        if (!TryResolveAttack(out var attackAddress, out var attackValue))
-        {
-            LastError = "Super Dano ainda não validou o atributo de ataque nesta build.";
-            return false;
-        }
-
-        _runtime.AttackAddress = attackAddress;
-        _originalAttack ??= attackValue;
-        _oneHitKill = true;
-        ApplySuperDamage();
-        LastError = string.Empty;
-        return true;
-    }
-
-    private bool TryResolveAttack(out nint address, out int value)
-    {
-        address = 0;
-        value = 0;
-
-        if (_memory is null || _runtime.Root == 0)
-            return false;
-
-        if (!_memory.TryReadPointer(_runtime.Root + 0x38, out var component))
-            return false;
-
-        if (!_memory.TryRead<int>(component, out var current)
-            || current <= 0
-            || current > 5_000_000)
-            return false;
-
-        address = component;
-        value = current;
-        return true;
-    }
-
-    private void ApplySuperDamage()
-    {
-        if (_memory is null || !_runtime.IsResolved)
-            return;
-
-        if (_runtime.AttackAddress == 0)
-        {
-            if (!TryResolveAttack(out var address, out var original))
-                return;
-
-            _runtime.AttackAddress = address;
-            _originalAttack ??= original;
-        }
-
-        if (!_memory.TryRead<int>(_runtime.AttackAddress, out var current)
-            || current <= 0
-            || current > 50_000_000)
-        {
-            _runtime.AttackAddress = 0;
+            InvalidateRuntime($"{label}: bloco de atributo deixou de validar. Relocalizando...");
             return;
         }
 
-        _originalAttack ??= current;
-        const int boostedAttack = 5_000_000;
-        if (current != boostedAttack)
-            _memory.Write(_runtime.AttackAddress, boostedAttack);
-    }
-
-    private void RestoreOriginalAttack()
-    {
-        if (_memory is null
-            || !_memory.IsAttached
-            || _runtime.AttackAddress == 0
-            || !_originalAttack.HasValue)
+        if (stat.Max <= 0)
             return;
 
-        try
-        {
-            _memory.Write(_runtime.AttackAddress, _originalAttack.Value);
-        }
-        catch
-        {
-        }
-        finally
-        {
-            _originalAttack = null;
-        }
+        if (stat.Current < stat.Max)
+            _memory.Write(entry + StatCurrentOffset, stat.Max);
     }
 
-    // ---------------------------------------------------------------------
-    // Runtime validation / diagnostics
-    // ---------------------------------------------------------------------
     private bool ValidateRuntime()
     {
-        if (_memory is null || !_runtime.IsResolved)
-            return false;
-
-        if (_runtime.Format == StatFormat.CurrentDword2026)
-            return ValidateCurrentStatsBase(_runtime.StatsBase, out _);
-
-        return ValidateLegacyStatEntry(_runtime.HealthEntry, HealthId)
-               && ValidateLegacyStatEntry(_runtime.StaminaEntry, StaminaId)
-               && ValidateLegacyStatEntry(_runtime.SpiritEntry, SpiritId);
+        return _runtime.IsResolved
+               && ValidateStatEntry(_runtime.HealthEntry, HealthId, out _)
+               && ValidateStatEntry(_runtime.StaminaEntry, StaminaId, out _)
+               && ValidateStatEntry(_runtime.SpiritEntry, SpiritId, out _);
     }
 
     private void CompleteSuccessfulResolution(
@@ -816,21 +715,10 @@ public sealed class CrimsonDesertModule : IGameModule
         diagnostics.Add($"Método vencedor: {method}");
         diagnostics.Add(detail);
         diagnostics.Add($"Actor: 0x{runtime.Actor.ToInt64():X}");
-
-        if (runtime.Format == StatFormat.CurrentDword2026)
-        {
-            diagnostics.Add($"StatsBase: 0x{runtime.StatsBase.ToInt64():X}");
-            diagnostics.Add($"HP current/max: 0x{runtime.HealthCurrent.ToInt64():X} / 0x{runtime.HealthMax.ToInt64():X}");
-            diagnostics.Add($"STA current/max: 0x{runtime.StaminaCurrent.ToInt64():X} / 0x{runtime.StaminaMax.ToInt64():X}");
-            diagnostics.Add($"SPI current/max: 0x{runtime.SpiritCurrent.ToInt64():X} / 0x{runtime.SpiritMax.ToInt64():X}");
-            runtime.LayoutName = "DWORD-2026-08";
-        }
-        else
-        {
-            diagnostics.Add($"HealthEntry: 0x{runtime.HealthEntry.ToInt64():X}");
-            diagnostics.Add($"StaminaEntry: 0x{runtime.StaminaEntry.ToInt64():X}");
-            diagnostics.Add($"SpiritEntry: 0x{runtime.SpiritEntry.ToInt64():X}");
-        }
+        diagnostics.Add($"StatsBase: 0x{runtime.StatsBase.ToInt64():X}");
+        diagnostics.Add($"HealthEntry: 0x{runtime.HealthEntry.ToInt64():X}");
+        diagnostics.Add($"StaminaEntry: 0x{runtime.StaminaEntry.ToInt64():X}");
+        diagnostics.Add($"SpiritEntry: 0x{runtime.SpiritEntry.ToInt64():X}");
 
         DiagnosticReport = string.Join(Environment.NewLine, diagnostics);
         RuntimeStatus = $"Jogador localizado • {method} • {runtime.LayoutName}";
@@ -842,7 +730,6 @@ public sealed class CrimsonDesertModule : IGameModule
         bool scheduleRetry = true,
         bool preserveDiagnostic = false)
     {
-        RestoreOriginalAttack();
         _runtime = new PlayerRuntime();
         RuntimeStatus = reason;
         LastError = reason;
@@ -854,36 +741,28 @@ public sealed class CrimsonDesertModule : IGameModule
             _nextResolveAttemptUtc = DateTime.UtcNow.AddMilliseconds(500);
     }
 
+    private static string FormatStat(StatSnapshot snapshot)
+        => $"type={snapshot.Type}, {snapshot.Current}/{snapshot.Max}";
+
     private readonly record struct WorldSystemPattern(
         string Name,
         string Signature,
         int DisplacementOffset,
         int InstructionEndOffset);
 
-    private readonly record struct LegacyStatLayout(
+    private readonly record struct StatLayout(
         int StaminaFromHealth,
         int SpiritFromHealth,
         string Name);
 
-    private readonly record struct CurrentStatsSnapshot(
-        int HpCurrent,
-        int HpMax,
-        int StaminaCurrent,
-        int StaminaMax,
-        int SpiritCurrent,
-        int SpiritMax);
-
-    private enum StatFormat
-    {
-        None,
-        CurrentDword2026,
-        LegacyQword
-    }
+    private readonly record struct StatSnapshot(
+        int Type,
+        long Current,
+        long Max);
 
     private sealed class PlayerRuntime
     {
         public bool IsResolved { get; set; }
-        public StatFormat Format { get; set; }
         public string LayoutName { get; set; } = string.Empty;
 
         public nint WorldSystem { get; set; }
@@ -891,20 +770,10 @@ public sealed class CrimsonDesertModule : IGameModule
         public nint Actor { get; set; }
         public nint Marker { get; set; }
         public nint Root { get; set; }
-        public int CharacterSlot { get; set; }
-
         public nint StatsBase { get; set; }
-        public nint HealthCurrent { get; set; }
-        public nint HealthMax { get; set; }
-        public nint StaminaCurrent { get; set; }
-        public nint StaminaMax { get; set; }
-        public nint SpiritCurrent { get; set; }
-        public nint SpiritMax { get; set; }
 
         public nint HealthEntry { get; set; }
         public nint StaminaEntry { get; set; }
         public nint SpiritEntry { get; set; }
-
-        public nint AttackAddress { get; set; }
     }
 }
