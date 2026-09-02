@@ -6,6 +6,50 @@
         Background="{StaticResource BackgroundBrush}"
         Foreground="{StaticResource TextBrush}"
         WindowStartupLocation="CenterScreen">
+    <Window.Resources>
+        <Style x:Key="TrainerToggle" TargetType="CheckBox">
+            <Setter Property="Foreground" Value="{StaticResource TextBrush}" />
+            <Setter Property="FontWeight" Value="SemiBold" />
+            <Setter Property="Cursor" Value="Hand" />
+            <Setter Property="Template">
+                <Setter.Value>
+                    <ControlTemplate TargetType="CheckBox">
+                        <Border x:Name="ToggleBorder"
+                                Width="92" Height="34"
+                                CornerRadius="17"
+                                Background="#1C2126"
+                                BorderBrush="#2C333A"
+                                BorderThickness="1">
+                            <Grid>
+                                <Grid.ColumnDefinitions>
+                                    <ColumnDefinition Width="*" />
+                                    <ColumnDefinition Width="*" />
+                                </Grid.ColumnDefinitions>
+                                <TextBlock x:Name="OffText" Grid.Column="0" Text="OFF"
+                                           HorizontalAlignment="Center" VerticalAlignment="Center"
+                                           Foreground="#B1B7BD" FontSize="11" FontWeight="Bold" />
+                                <TextBlock x:Name="OnText" Grid.Column="1" Text="ON"
+                                           HorizontalAlignment="Center" VerticalAlignment="Center"
+                                           Foreground="#646B72" FontSize="11" FontWeight="Bold" />
+                            </Grid>
+                        </Border>
+                        <ControlTemplate.Triggers>
+                            <Trigger Property="IsChecked" Value="True">
+                                <Setter TargetName="ToggleBorder" Property="Background" Value="#14382F" />
+                                <Setter TargetName="ToggleBorder" Property="BorderBrush" Value="#2E8B76" />
+                                <Setter TargetName="OffText" Property="Foreground" Value="#527068" />
+                                <Setter TargetName="OnText" Property="Foreground" Value="#68E3C7" />
+                            </Trigger>
+                            <Trigger Property="IsEnabled" Value="False">
+                                <Setter TargetName="ToggleBorder" Property="Opacity" Value="0.45" />
+                            </Trigger>
+                        </ControlTemplate.Triggers>
+                    </ControlTemplate>
+                </Setter.Value>
+            </Setter>
+        </Style>
+    </Window.Resources>
+
     <Grid>
         <Grid.ColumnDefinitions>
             <ColumnDefinition Width="220" />
@@ -19,13 +63,13 @@
                     <Button Content="Biblioteca" Height="42" Margin="0,0,0,8" HorizontalContentAlignment="Left" Padding="14,0" />
                     <Button Content="Crimson Desert" Height="42" HorizontalContentAlignment="Left" Padding="14,0" />
                 </StackPanel>
-                <TextBlock DockPanel.Dock="Bottom" Text="v0.1.0 • Protótipo" Foreground="{StaticResource MutedTextBrush}" FontSize="12" />
+                <TextBlock DockPanel.Dock="Bottom" Text="v0.2.0 • Crimson Desert" Foreground="{StaticResource MutedTextBrush}" FontSize="12" />
             </DockPanel>
         </Border>
 
         <ScrollViewer Grid.Column="1" VerticalScrollBarVisibility="Auto">
             <StackPanel Margin="34,30,34,50">
-                <Grid Margin="0,0,0,26">
+                <Grid Margin="0,0,0,12">
                     <Grid.ColumnDefinitions>
                         <ColumnDefinition Width="*" />
                         <ColumnDefinition Width="Auto" />
@@ -39,6 +83,11 @@
                     </Border>
                 </Grid>
 
+                <TextBlock x:Name="TrainerStatusText"
+                           Text="Os recursos serão habilitados quando o personagem for localizado no mundo do jogo."
+                           Foreground="{StaticResource MutedTextBrush}"
+                           FontSize="12" Margin="0,0,0,24" TextWrapping="Wrap" />
+
                 <ItemsControl x:Name="SectionsControl">
                     <ItemsControl.ItemTemplate>
                         <DataTemplate>
@@ -48,16 +97,24 @@
                                     <ItemsControl ItemsSource="{Binding Features}">
                                         <ItemsControl.ItemTemplate>
                                             <DataTemplate>
-                                                <Grid Margin="0,8">
+                                                <Grid Margin="0,10">
                                                     <Grid.ColumnDefinitions>
                                                         <ColumnDefinition Width="*" />
-                                                        <ColumnDefinition Width="220" />
+                                                        <ColumnDefinition Width="120" />
                                                     </Grid.ColumnDefinitions>
-                                                    <StackPanel>
+                                                    <StackPanel VerticalAlignment="Center">
                                                         <TextBlock Text="{Binding Name}" FontSize="14" FontWeight="SemiBold" />
-                                                        <TextBlock Text="{Binding Description}" Foreground="{StaticResource MutedTextBrush}" FontSize="11" />
+                                                        <TextBlock Text="{Binding Description}" Foreground="{StaticResource MutedTextBrush}"
+                                                                   FontSize="11" Margin="0,3,20,0" TextWrapping="Wrap" />
                                                     </StackPanel>
-                                                    <TextBlock Grid.Column="1" Text="Pronto para mapear" Foreground="{StaticResource MutedTextBrush}" HorizontalAlignment="Right" VerticalAlignment="Center" />
+                                                    <CheckBox Grid.Column="1"
+                                                              Style="{StaticResource TrainerToggle}"
+                                                              HorizontalAlignment="Right"
+                                                              VerticalAlignment="Center"
+                                                              Tag="{Binding Id}"
+                                                              IsEnabled="{Binding IsAvailable}"
+                                                              Checked="FeatureToggle_Checked"
+                                                              Unchecked="FeatureToggle_Unchecked" />
                                                 </Grid>
                                             </DataTemplate>
                                         </ItemsControl.ItemTemplate>
