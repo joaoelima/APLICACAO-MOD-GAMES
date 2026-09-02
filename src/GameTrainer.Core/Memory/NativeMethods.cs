@@ -29,7 +29,21 @@ internal static class NativeMethods
 
     internal enum MemoryState : uint
     {
-        Commit = 0x1000
+        Commit = 0x1000,
+        Reserve = 0x2000,
+        Free = 0x10000
+    }
+
+    [Flags]
+    internal enum AllocationType : uint
+    {
+        Commit = 0x1000,
+        Reserve = 0x2000
+    }
+
+    internal enum FreeType : uint
+    {
+        Release = 0x8000
     }
 
     [StructLayout(LayoutKind.Sequential)]
@@ -71,6 +85,38 @@ internal static class NativeMethods
         IntPtr address,
         out MemoryBasicInformation buffer,
         UIntPtr length);
+
+    [DllImport("kernel32.dll", SetLastError = true)]
+    internal static extern IntPtr VirtualAllocEx(
+        IntPtr processHandle,
+        IntPtr address,
+        UIntPtr size,
+        AllocationType allocationType,
+        MemoryProtection protection);
+
+    [DllImport("kernel32.dll", SetLastError = true)]
+    [return: MarshalAs(UnmanagedType.Bool)]
+    internal static extern bool VirtualFreeEx(
+        IntPtr processHandle,
+        IntPtr address,
+        UIntPtr size,
+        FreeType freeType);
+
+    [DllImport("kernel32.dll", SetLastError = true)]
+    [return: MarshalAs(UnmanagedType.Bool)]
+    internal static extern bool VirtualProtectEx(
+        IntPtr processHandle,
+        IntPtr address,
+        UIntPtr size,
+        MemoryProtection newProtection,
+        out MemoryProtection oldProtection);
+
+    [DllImport("kernel32.dll", SetLastError = true)]
+    [return: MarshalAs(UnmanagedType.Bool)]
+    internal static extern bool FlushInstructionCache(
+        IntPtr processHandle,
+        IntPtr baseAddress,
+        UIntPtr size);
 
     [DllImport("kernel32.dll", SetLastError = true)]
     [return: MarshalAs(UnmanagedType.Bool)]
