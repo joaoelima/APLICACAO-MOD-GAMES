@@ -1,5 +1,6 @@
 using System.Diagnostics;
 using System.Windows;
+using System.Windows.Controls;
 using GameTrainer.Core.Memory;
 using GameTrainer.Core.Processes;
 using GameTrainer.Modules.CrimsonDesert;
@@ -11,39 +12,59 @@ public partial class MainWindow : Window
     private readonly CrimsonDesertModule _module = new();
     private readonly GameProcessDetector _detector = new();
     private readonly ProcessMemory _memory = new();
-    private readonly System.Windows.Threading.DispatcherTimer _timer;
+    private readonly System.Windows.Threading.DispatcherTimer _processTimer;
+    private readonly System.Windows.Threading.DispatcherTimer _trainerTimer;
+
     private int? _attachedProcessId;
+    private bool _updatingToggle;
+    private bool _refreshingGameState;
+    private bool _trainerTickRunning;
 
     public MainWindow()
     {
         InitializeComponent();
         SectionsControl.ItemsSource = _module.Definition.Sections;
 
-        _timer = new System.Windows.Threading.DispatcherTimer
+        _processTimer = new System.Windows.Threading.DispatcherTimer
         {
             Interval = TimeSpan.FromSeconds(2)
         };
-        _timer.Tick += (_, _) => RefreshGameState();
-        _timer.Start();
+        _processTimer.Tick += async (_, _) => await RefreshGameStateAsync();
+        _processTimer.Start();
 
-        RefreshGameState();
+        // Escritas pequenas e periódicas, somente enquanto algum recurso estiver ativo.
+        _trainerTimer = new System.Windows.Threading.DispatcherTimer
+        {
+            Interval = TimeSpan.FromMilliseconds(50)
+        };
+        _trainerTimer.Tick += async (_, _) => await RunTrainerTickAsync();
+        _trainerTimer.Start();
+
+        _ = RefreshGameStateAsync();
     }
 
-    private async void RefreshGameState()
+    private async Task RefreshGameStateAsync()
     {
+        if (_refreshingGameState)
+            return;
+
+        _refreshingGameState = true;
         try
         {
             var process = _detector.FindRunningProcess(_module.Definition.ProcessNames);
             if (process is null)
             {
-                if (_memory.IsAttached) _memory.Detach();
+                if (_memory.IsAttached)
+                    _memory.Detach();
+
                 _attachedProcessId = null;
                 GameStatusText.Text = "Aguardando o Crimson Desert ser iniciado...";
+                TrainerStatusText.Text = "Abra o jogo e carregue o personagem para ativar as modificações.";
                 StatusBadge.Text = "DESCONECTADO";
                 return;
             }
 
-            if (_attachedProcessId != process.Id)
+            if (_attachedProcessId != process.Id || !_memory.IsAttached)
             {
                 _memory.Attach(process);
                 await _module.AttachAsync(_memory);
@@ -51,13 +72,102 @@ public partial class MainWindow : Window
             }
 
             var version = TryGetVersion(process);
-            GameStatusText.Text = $"Jogo em execução • PID {process.Id}" + (version is null ? string.Empty : $" • {version}");
+            GameStatusText.Text = $"Jogo em execução • PID {process.Id}" +
+                                  (version is null ? string.Empty : $" • {version}");
+            TrainerStatusText.Text = _module.RuntimeStatus;
             StatusBadge.Text = "CONECTADO";
         }
         catch (Exception ex)
         {
             GameStatusText.Text = $"Falha ao conectar: {ex.Message}";
+            TrainerStatusText.Text = "O trainer não fará escritas enquanto a conexão não estiver válida.";
             StatusBadge.Text = "ERRO";
+        }
+        finally
+        {
+            _refreshingGameState = false;
+        }
+    }
+
+    private async Task RunTrainerTickAsync()
+    {
+        if (_trainerTickRunning || !_memory.IsAttached)
+            return;
+
+        _trainerTickRunning = true;
+        try
+        {
+            await _module.TickAsync();
+            TrainerStatusText.Text = _module.RuntimeStatus;
+        }
+        catch (Exception ex)
+        {
+            TrainerStatusText.Text = $"Falha no ciclo do trainer: {ex.Message}";
+        }
+        finally
+        {
+            _trainerTickRunning = false;
+        }
+    }
+
+    private async void FeatureToggle_Checked(object sender, RoutedEventArgs e)
+    {
+        if (_updatingToggle || sender is not CheckBox toggle || toggle.Tag is not string featureId)
+            return;
+
+        await ApplyToggleAsync(toggle, featureId, true);
+    }
+
+    private async void FeatureToggle_Unchecked(object sender, RoutedEventArgs e)
+    {
+        if (_updatingToggle || sender is not CheckBox toggle || toggle.Tag is not string featureId)
+            return;
+
+        await ApplyToggleAsync(toggle, featureId, false);
+    }
+
+    private async Task ApplyToggleAsync(CheckBox toggle, string featureId, bool enabled)
+    {
+        if (!_memory.IsAttached)
+        {
+            SetToggleVisual(toggle, !enabled);
+            TrainerStatusText.Text = "Inicie o Crimson Desert antes de ativar uma modificação.";
+            return;
+        }
+
+        try
+        {
+            var success = await _module.SetToggleAsync(featureId, enabled);
+            if (!success)
+            {
+                SetToggleVisual(toggle, !enabled);
+                TrainerStatusText.Text = string.IsNullOrWhiteSpace(_module.LastError)
+                    ? "Não foi possível ativar este recurso nesta versão do jogo."
+                    : _module.LastError;
+                return;
+            }
+
+            TrainerStatusText.Text = enabled
+                ? $"Recurso ativado • {_module.RuntimeStatus}"
+                : $"Recurso desativado • {_module.RuntimeStatus}";
+        }
+        catch (Exception ex)
+        {
+            SetToggleVisual(toggle, !enabled);
+            TrainerStatusText.Text = $"Falha ao alterar o recurso: {ex.Message}";
+        }
+    }
+
+    private void SetToggleVisual(CheckBox toggle, bool value)
+    {
+        _updatingToggle = true;
+        try
+        {
+            toggle.IsChecked = value;
+        }
+        finally
+        {
+            _updatingToggle = false;
         }
     }
 
@@ -66,7 +176,9 @@ public partial class MainWindow : Window
         try
         {
             var path = process.MainModule?.FileName;
-            if (string.IsNullOrWhiteSpace(path)) return null;
+            if (string.IsNullOrWhiteSpace(path))
+                return null;
+
             var info = FileVersionInfo.GetVersionInfo(path);
             return info.FileVersion;
         }
@@ -78,7 +190,19 @@ public partial class MainWindow : Window
 
     protected override void OnClosed(EventArgs e)
     {
-        _timer.Stop();
+        _processTimer.Stop();
+        _trainerTimer.Stop();
+
+        try
+        {
+            if (_memory.IsAttached)
+                _module.SetToggleAsync("one-hit-kill", false).GetAwaiter().GetResult();
+        }
+        catch
+        {
+            // Encerramento do aplicativo: não há ação adicional necessária.
+        }
+
         _memory.Dispose();
         base.OnClosed(e);
     }
