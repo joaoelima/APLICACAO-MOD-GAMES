@@ -13,14 +13,18 @@ public sealed class CrimsonDesertModule : IGameModule
     private const int CurrentValueOffset = 0x08;
     private const int MaxValueOffset = 0x18;
 
+    private const int StaticPlayerBaseRva = 0x05CC7618;
+    private const string PlayerBaseDiscoveryPattern =
+        "48 8B 0D ? ? ? ? E8 ? ? ? ? 41 B0 01 48 8B 53 08 48 8D 4C 24 40";
+
     private static readonly StatLayout CurrentLayout = new(0x510, 0x5A0, "atual");
     private static readonly StatLayout LegacyLayout = new(0x480, 0x510, "legado");
 
     private static readonly WorldSystemPattern[] WorldSystemPatterns =
     {
-        new("48 83 EC 28 48 8B 0D ? ? ? ? 48 8B 49 ? E8 ? ? ? ? 84 C0 0F 94 C0 48 83 C4 28 C3", 7, 11),
-        new("80 B8 ? ? ? ? 00 75 ? 48 8B 05 ? ? ? ? 48 8B 88 ? ? ? ?", 12, 16),
-        new("48 8B 0D ? ? ? ? 48 8B 49 ? E8 ? ? ? ? 84 C0 0F 94 C0", 3, 7)
+        new("P1", "48 83 EC 28 48 8B 0D ? ? ? ? 48 8B 49 ? E8 ? ? ? ? 84 C0 0F 94 C0 48 83 C4 28 C3", 7, 11),
+        new("P2", "80 B8 ? ? ? ? 00 75 ? 48 8B 05 ? ? ? ? 48 8B 88 ? ? ? ?", 12, 16),
+        new("P3", "48 8B 0D ? ? ? ? 48 8B 49 ? E8 ? ? ? ? 84 C0 0F 94 C0", 3, 7)
     };
 
     private ProcessMemory? _memory;
@@ -36,6 +40,8 @@ public sealed class CrimsonDesertModule : IGameModule
 
     public string LastError { get; private set; } = string.Empty;
     public string RuntimeStatus { get; private set; } = "Aguardando o jogo";
+    public string DiagnosticReport { get; private set; } = "Nenhum diagnóstico executado ainda.";
+    public bool IsRuntimeResolved => _runtime.IsResolved;
 
     public GameDefinition Definition { get; } = new()
     {
@@ -95,9 +101,26 @@ public sealed class CrimsonDesertModule : IGameModule
         _runtime = new PlayerRuntime();
         _originalAttack = null;
         LastError = string.Empty;
+        DiagnosticReport = "Iniciando diagnóstico da memória do Crimson Desert...";
 
         ResolveRuntime(force: true);
         return Task.CompletedTask;
+    }
+
+    public Task<bool> ReprobeAsync(CancellationToken cancellationToken = default)
+    {
+        if (_memory is null || !_memory.IsAttached)
+        {
+            LastError = "O Crimson Desert não está conectado.";
+            RuntimeStatus = LastError;
+            DiagnosticReport = LastError;
+            return Task.FromResult(false);
+        }
+
+        RestoreOriginalAttack();
+        _runtime = new PlayerRuntime();
+        _nextResolveAttemptUtc = DateTime.MinValue;
+        return Task.FromResult(ResolveRuntime(force: true));
     }
 
     public Task<bool> SetToggleAsync(string featureId, bool enabled, CancellationToken cancellationToken = default)
@@ -215,8 +238,6 @@ public sealed class CrimsonDesertModule : IGameModule
 
         _originalAttack ??= currentAttack;
 
-        // Valor alto, mas ainda dentro de uma faixa segura de int32.
-        // Se o jogo limitar internamente o dano, o recurso simplesmente terá efeito reduzido.
         const int boostedAttack = 5_000_000;
         if (currentAttack != boostedAttack)
             _memory.Write(_runtime.AttackAddress, boostedAttack);
@@ -233,7 +254,7 @@ public sealed class CrimsonDesertModule : IGameModule
         }
         catch
         {
-            // O jogador pode ter trocado de mapa/personagem e invalidado o endereço.
+            // O endereço pode ter mudado após loading, troca de personagem ou mapa.
         }
         finally
         {
@@ -275,7 +296,12 @@ public sealed class CrimsonDesertModule : IGameModule
         if (!force && DateTime.UtcNow < _nextResolveAttemptUtc)
             return false;
 
-        _nextResolveAttemptUtc = DateTime.UtcNow.AddSeconds(1);
+        _nextResolveAttemptUtc = DateTime.UtcNow.AddSeconds(2);
+        var diagnostics = new List<string>
+        {
+            "Diagnóstico v0.2.1",
+            $"Módulo: 0x{_memory.MainModuleBase.ToInt64():X} / 0x{_memory.MainModuleSize:X} bytes"
+        };
 
         try
         {
@@ -283,55 +309,236 @@ public sealed class CrimsonDesertModule : IGameModule
             {
                 var match = _memory.FindPatternInMainModule(pattern.Signature);
                 if (!match.HasValue)
+                {
+                    diagnostics.Add($"WorldSystem {pattern.Name}: assinatura não encontrada");
                     continue;
+                }
 
+                diagnostics.Add($"WorldSystem {pattern.Name}: assinatura OK");
                 var globalSlot = _memory.ResolveRipRelative(match.Value, pattern.DisplacementOffset, pattern.InstructionEndOffset);
                 if (!_memory.TryReadPointer(globalSlot, out var worldSystem))
+                {
+                    diagnostics.Add($"WorldSystem {pattern.Name}: ponteiro RIP inválido");
                     continue;
+                }
 
-                if (!TryResolvePlayer(worldSystem, out var runtime))
-                    continue;
+                if (TryResolvePlayerFromWorldSystem(worldSystem, out var runtime, out var detail))
+                {
+                    CompleteSuccessfulResolution(runtime, $"WorldSystem {pattern.Name}", diagnostics, detail);
+                    return true;
+                }
 
-                _runtime = runtime;
-                RuntimeStatus = $"Jogador localizado, layout de atributos {_runtime.LayoutName}";
-                LastError = string.Empty;
-                return true;
+                diagnostics.Add($"WorldSystem {pattern.Name}: {detail}");
             }
 
-            InvalidateRuntime("Não foi possível localizar a estrutura do jogador. Entre no mundo do jogo e tente novamente.", scheduleRetry: false);
+            if (TryResolvePlayerViaBaseSignature(out var sigRuntime, out var sigDetail))
+            {
+                CompleteSuccessfulResolution(sigRuntime, "PlayerBase AOB", diagnostics, sigDetail);
+                return true;
+            }
+            diagnostics.Add($"PlayerBase AOB: {sigDetail}");
+
+            if (TryResolvePlayerViaStaticBase(out var staticRuntime, out var staticDetail))
+            {
+                CompleteSuccessfulResolution(staticRuntime, "PlayerBase estático", diagnostics, staticDetail);
+                return true;
+            }
+            diagnostics.Add($"PlayerBase estático: {staticDetail}");
+
+            DiagnosticReport = string.Join(Environment.NewLine, diagnostics);
+            InvalidateRuntime(
+                "Não foi possível localizar o jogador. Clique em “Reanalisar memória” e depois em “Copiar diagnóstico”.",
+                scheduleRetry: false,
+                preserveDiagnostic: true);
             return false;
         }
         catch (Exception ex)
         {
-            InvalidateRuntime($"Falha ao localizar o jogador: {ex.Message}", scheduleRetry: false);
+            diagnostics.Add($"Exceção: {ex.GetType().Name} - {ex.Message}");
+            DiagnosticReport = string.Join(Environment.NewLine, diagnostics);
+            InvalidateRuntime(
+                "Falha durante o diagnóstico da memória. Use “Copiar diagnóstico” para me enviar os detalhes.",
+                scheduleRetry: false,
+                preserveDiagnostic: true);
             return false;
         }
     }
 
-    private bool TryResolvePlayer(nint worldSystem, out PlayerRuntime runtime)
+    private void CompleteSuccessfulResolution(
+        PlayerRuntime runtime,
+        string method,
+        List<string> diagnostics,
+        string detail)
+    {
+        _runtime = runtime;
+        diagnostics.Add($"Método vencedor: {method}");
+        diagnostics.Add(detail);
+        diagnostics.Add($"Actor: 0x{runtime.Actor.ToInt64():X}");
+        diagnostics.Add($"Health: 0x{runtime.HealthEntry.ToInt64():X}");
+        diagnostics.Add($"Stamina: 0x{runtime.StaminaEntry.ToInt64():X}");
+        diagnostics.Add($"Spirit: 0x{runtime.SpiritEntry.ToInt64():X}");
+        DiagnosticReport = string.Join(Environment.NewLine, diagnostics);
+        RuntimeStatus = $"Jogador localizado • {method} • layout {runtime.LayoutName}";
+        LastError = string.Empty;
+    }
+
+    private bool TryResolvePlayerFromWorldSystem(nint worldSystem, out PlayerRuntime runtime, out string detail)
     {
         runtime = new PlayerRuntime { WorldSystem = worldSystem };
+        detail = "";
 
-        if (_memory is null || !_memory.TryReadPointer(worldSystem + 0x30, out var actorManager))
+        if (_memory is null)
+        {
+            detail = "memória não disponível";
             return false;
+        }
+
+        if (!_memory.TryReadPointer(worldSystem + 0x30, out var actorManager))
+        {
+            detail = "WorldSystem OK, ActorManager (+0x30) inválido";
+            return false;
+        }
 
         if (!_memory.TryReadPointer(actorManager + 0x28, out var actor))
+        {
+            detail = "ActorManager OK, UserActor (+0x28) inválido";
             return false;
+        }
 
-        if (!_memory.TryReadPointer(actor + 0x20, out var marker))
+        if (!TryResolvePlayerFromActor(actor, out runtime, out var actorDetail))
+        {
+            detail = $"Actor OK, {actorDetail}";
             return false;
+        }
 
-        if (!_memory.TryReadPointer(marker + 0x18, out var root))
-            return false;
+        runtime.WorldSystem = worldSystem;
+        runtime.ActorManager = actorManager;
+        detail = $"WorldSystem/ActorManager/UserActor OK; {actorDetail}";
+        return true;
+    }
 
-        if (!_memory.TryReadPointer(root + 0x58, out var healthEntry) || !ValidateStatEntry(healthEntry, HealthId))
+    private bool TryResolvePlayerViaBaseSignature(out PlayerRuntime runtime, out string detail)
+    {
+        runtime = new PlayerRuntime();
+        detail = "";
+
+        if (_memory is null)
+        {
+            detail = "memória não disponível";
             return false;
+        }
+
+        var match = _memory.FindPatternInMainModule(PlayerBaseDiscoveryPattern);
+        if (!match.HasValue)
+        {
+            detail = "assinatura não encontrada";
+            return false;
+        }
+
+        var storage = _memory.ResolveRipRelative(match.Value, 3, 7);
+        if (!_memory.TryReadPointer(storage, out var playerBase))
+        {
+            detail = "assinatura OK, storage/base inválido";
+            return false;
+        }
+
+        if (!TryResolvePointerChain(playerBase, new[] { 0x18, 0xA0, 0xD0, 0x68 }, out var actor))
+        {
+            detail = "base OK, cadeia +18/+A0/+D0/+68 falhou";
+            return false;
+        }
+
+        if (!TryResolvePlayerFromActor(actor, out runtime, out var actorDetail))
+        {
+            detail = $"actor pela base OK, {actorDetail}";
+            return false;
+        }
+
+        detail = $"assinatura/base/actor OK; {actorDetail}";
+        return true;
+    }
+
+    private bool TryResolvePlayerViaStaticBase(out PlayerRuntime runtime, out string detail)
+    {
+        runtime = new PlayerRuntime();
+        detail = "";
+
+        if (_memory is null)
+        {
+            detail = "memória não disponível";
+            return false;
+        }
+
+        var storage = _memory.MainModuleBase + StaticPlayerBaseRva;
+        if (!_memory.TryReadPointer(storage, out var playerBase))
+        {
+            detail = $"RVA 0x{StaticPlayerBaseRva:X} não contém base válida";
+            return false;
+        }
+
+        if (!TryResolvePointerChain(playerBase, new[] { 0x18, 0xA0, 0xD0, 0x68 }, out var actor))
+        {
+            detail = "base válida, cadeia +18/+A0/+D0/+68 falhou";
+            return false;
+        }
+
+        if (!TryResolvePlayerFromActor(actor, out runtime, out var actorDetail))
+        {
+            detail = $"actor pela base estática OK, {actorDetail}";
+            return false;
+        }
+
+        detail = $"RVA legado/base/actor OK; {actorDetail}";
+        return true;
+    }
+
+    private bool TryResolvePlayerFromActor(nint actor, out PlayerRuntime runtime, out string detail)
+    {
+        runtime = new PlayerRuntime { Actor = actor };
+        detail = "";
+
+        if (_memory is null || !_memory.IsReadable(actor, 0x60))
+        {
+            detail = "Actor não está legível";
+            return false;
+        }
+
+        nint marker = 0;
+        nint root = 0;
+        if (_memory.TryReadPointer(actor + 0x20, out marker))
+            _memory.TryReadPointer(marker + 0x18, out root);
+
+        nint healthEntry = 0;
+        var healthRoute = string.Empty;
+
+        // Caminho publicado mais recente: actor + 0x58 -> entrada/componente de HP.
+        if (_memory.TryReadPointer(actor + 0x58, out var directHealth) && ValidateStatEntry(directHealth, HealthId))
+        {
+            healthEntry = directHealth;
+            healthRoute = "HP via Actor+0x58";
+        }
+        // Fallback legado: actor -> marker -> root -> +0x58 -> HP.
+        else if (root != 0 && _memory.TryReadPointer(root + 0x58, out var rootedHealth) && ValidateStatEntry(rootedHealth, HealthId))
+        {
+            healthEntry = rootedHealth;
+            healthRoute = "HP via Marker/Root+0x58";
+        }
+        else
+        {
+            detail = marker == 0
+                ? "Actor encontrado, mas Marker (+0x20) e HP direto (+0x58) não validaram"
+                : root == 0
+                    ? "Marker OK, Root (+0x18) inválido e HP direto (+0x58) não validou"
+                    : "Marker/Root OK, mas nenhuma entrada de HP válida foi encontrada em +0x58";
+            return false;
+        }
 
         if (!TryResolveStatLayout(healthEntry, out var staminaEntry, out var spiritEntry, out var layoutName))
+        {
+            detail = $"{healthRoute} OK, mas offsets de Vigor/Espírito não bateram";
             return false;
+        }
 
-        runtime.ActorManager = actorManager;
-        runtime.Actor = actor;
         runtime.Marker = marker;
         runtime.Root = root;
         runtime.HealthEntry = healthEntry;
@@ -340,11 +547,26 @@ public sealed class CrimsonDesertModule : IGameModule
         runtime.LayoutName = layoutName;
         runtime.IsResolved = true;
 
-        // O componente de combate é validado separadamente, pois pode mudar entre versões.
-        if (TryResolveAttack(out var attackAddress, out _, root))
+        if (root != 0 && TryResolveAttack(out var attackAddress, out _, root))
             runtime.AttackAddress = attackAddress;
 
+        detail = $"{healthRoute}; Vigor/Espírito layout {layoutName}";
         return true;
+    }
+
+    private bool TryResolvePointerChain(nint baseAddress, IReadOnlyList<int> offsets, out nint value)
+    {
+        value = baseAddress;
+        if (_memory is null || value == 0)
+            return false;
+
+        foreach (var offset in offsets)
+        {
+            if (!_memory.TryReadPointer(value + offset, out value))
+                return false;
+        }
+
+        return value != 0;
     }
 
     private bool TryResolveStatLayout(nint healthEntry, out nint staminaEntry, out nint spiritEntry, out string layoutName)
@@ -379,15 +601,12 @@ public sealed class CrimsonDesertModule : IGameModule
         if (root == 0)
             return false;
 
-        // A cadeia publicada para o componente de combate usa o mesmo root dos atributos,
-        // porém troca o ramo +0x58 (stats) por +0x38 (combate).
         if (!_memory.TryReadPointer(root + 0x38, out var combatComponent))
             return false;
 
         if (!_memory.TryRead<int>(combatComponent, out var currentAttack))
             return false;
 
-        // Evita escrever quando a estrutura não parece ser realmente o componente de combate.
         if (currentAttack <= 0 || currentAttack > 5_000_000)
             return false;
 
@@ -421,17 +640,27 @@ public sealed class CrimsonDesertModule : IGameModule
         return max > 0 && max < 10_000_000_000_000L && current >= 0 && current <= max * 2;
     }
 
-    private void InvalidateRuntime(string reason, bool scheduleRetry = true)
+    private void InvalidateRuntime(
+        string reason,
+        bool scheduleRetry = true,
+        bool preserveDiagnostic = false)
     {
         RestoreOriginalAttack();
         _runtime = new PlayerRuntime();
         RuntimeStatus = reason;
         LastError = reason;
+        if (!preserveDiagnostic)
+            DiagnosticReport = reason;
         if (scheduleRetry)
             _nextResolveAttemptUtc = DateTime.UtcNow.AddMilliseconds(500);
     }
 
-    private readonly record struct WorldSystemPattern(string Signature, int DisplacementOffset, int InstructionEndOffset);
+    private readonly record struct WorldSystemPattern(
+        string Name,
+        string Signature,
+        int DisplacementOffset,
+        int InstructionEndOffset);
+
     private readonly record struct StatLayout(int StaminaFromHealth, int SpiritFromHealth, string Name);
 
     private sealed class PlayerRuntime
