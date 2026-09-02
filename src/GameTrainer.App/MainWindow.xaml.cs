@@ -39,7 +39,6 @@ public partial class MainWindow : Window
         };
         _trainerTimer.Tick += async (_, _) => await RunTrainerTickAsync();
 
-        // A janela é renderizada primeiro. Só depois iniciamos qualquer varredura pesada.
         ContentRendered += MainWindow_ContentRendered;
     }
 
@@ -52,8 +51,7 @@ public partial class MainWindow : Window
         _processTimer.Start();
         _trainerTimer.Start();
 
-        // Deixa a primeira pintura da janela terminar antes de procurar o processo.
-        await Dispatcher.Yield(System.Windows.Threading.DispatcherPriority.Background);
+        await System.Windows.Threading.Dispatcher.Yield(System.Windows.Threading.DispatcherPriority.Background);
         await RefreshGameStateAsync();
     }
 
@@ -90,8 +88,6 @@ public partial class MainWindow : Window
                 TrainerStatusText.Text = "Jogo detectado. Analisando a memória em segundo plano...";
                 StatusBadge.Text = "ANALISANDO";
 
-                // IMPORTANTE: ResolveRuntime faz AOB scan e várias leituras. Ele nunca deve
-                // rodar no Dispatcher/UI thread, senão a janela deixa de renderizar/responder.
                 await Task.Run(() => _module.AttachAsync(_memory));
 
                 if (_isClosing)
@@ -150,7 +146,6 @@ public partial class MainWindow : Window
 
         try
         {
-            // O botão continua responsivo durante toda a varredura.
             var ok = await Task.Run(() => _module.ReprobeAsync());
 
             if (_isClosing)
