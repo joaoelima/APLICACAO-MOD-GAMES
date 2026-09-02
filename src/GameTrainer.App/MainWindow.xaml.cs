@@ -19,6 +19,8 @@ public partial class MainWindow : Window
     private bool _updatingToggle;
     private bool _refreshingGameState;
     private bool _trainerTickRunning;
+    private bool _initialScanStarted;
+    private bool _isClosing;
 
     public MainWindow()
     {
@@ -30,21 +32,34 @@ public partial class MainWindow : Window
             Interval = TimeSpan.FromSeconds(2)
         };
         _processTimer.Tick += async (_, _) => await RefreshGameStateAsync();
-        _processTimer.Start();
 
         _trainerTimer = new System.Windows.Threading.DispatcherTimer
         {
             Interval = TimeSpan.FromMilliseconds(50)
         };
         _trainerTimer.Tick += async (_, _) => await RunTrainerTickAsync();
+
+        // A janela é renderizada primeiro. Só depois iniciamos qualquer varredura pesada.
+        ContentRendered += MainWindow_ContentRendered;
+    }
+
+    private async void MainWindow_ContentRendered(object? sender, EventArgs e)
+    {
+        if (_initialScanStarted)
+            return;
+
+        _initialScanStarted = true;
+        _processTimer.Start();
         _trainerTimer.Start();
 
-        _ = RefreshGameStateAsync();
+        // Deixa a primeira pintura da janela terminar antes de procurar o processo.
+        await Dispatcher.Yield(System.Windows.Threading.DispatcherPriority.Background);
+        await RefreshGameStateAsync();
     }
 
     private async Task RefreshGameStateAsync()
     {
-        if (_refreshingGameState)
+        if (_refreshingGameState || _isClosing)
             return;
 
         _refreshingGameState = true;
@@ -63,21 +78,34 @@ public partial class MainWindow : Window
                 return;
             }
 
-            if (_attachedProcessId != process.Id || !_memory.IsAttached)
-            {
-                _memory.Attach(process);
-                await _module.AttachAsync(_memory);
-                _attachedProcessId = process.Id;
-            }
-
             var version = TryGetVersion(process);
             GameStatusText.Text = $"Jogo em execução • PID {process.Id}" +
                                   (version is null ? string.Empty : $" • {version}");
+
+            if (_attachedProcessId != process.Id || !_memory.IsAttached)
+            {
+                _memory.Attach(process);
+                _attachedProcessId = process.Id;
+
+                TrainerStatusText.Text = "Jogo detectado. Analisando a memória em segundo plano...";
+                StatusBadge.Text = "ANALISANDO";
+
+                // IMPORTANTE: ResolveRuntime faz AOB scan e várias leituras. Ele nunca deve
+                // rodar no Dispatcher/UI thread, senão a janela deixa de renderizar/responder.
+                await Task.Run(() => _module.AttachAsync(_memory));
+
+                if (_isClosing)
+                    return;
+            }
+
             TrainerStatusText.Text = _module.RuntimeStatus;
-            StatusBadge.Text = "CONECTADO";
+            StatusBadge.Text = _module.IsRuntimeResolved ? "CONECTADO" : "DIAGNÓSTICO";
         }
         catch (Exception ex)
         {
+            if (_isClosing)
+                return;
+
             GameStatusText.Text = $"Falha ao conectar: {ex.Message}";
             TrainerStatusText.Text = "O trainer não fará escritas enquanto a conexão não estiver válida.";
             StatusBadge.Text = "ERRO";
@@ -90,7 +118,7 @@ public partial class MainWindow : Window
 
     private async Task RunTrainerTickAsync()
     {
-        if (_trainerTickRunning || !_memory.IsAttached)
+        if (_trainerTickRunning || !_memory.IsAttached || _isClosing)
             return;
 
         _trainerTickRunning = true;
@@ -117,18 +145,25 @@ public partial class MainWindow : Window
             return;
         }
 
-        TrainerStatusText.Text = "Reanalisando memória do jogo...";
+        TrainerStatusText.Text = "Reanalisando memória em segundo plano...";
+        StatusBadge.Text = "ANALISANDO";
+
         try
         {
-            var ok = await _module.ReprobeAsync();
+            // O botão continua responsivo durante toda a varredura.
+            var ok = await Task.Run(() => _module.ReprobeAsync());
+
+            if (_isClosing)
+                return;
+
             TrainerStatusText.Text = _module.RuntimeStatus;
-            if (!ok)
-                StatusBadge.Text = "DIAGNÓSTICO";
-            else
-                StatusBadge.Text = "CONECTADO";
+            StatusBadge.Text = ok ? "CONECTADO" : "DIAGNÓSTICO";
         }
         catch (Exception ex)
         {
+            if (_isClosing)
+                return;
+
             TrainerStatusText.Text = $"Falha ao reanalisar: {ex.Message}";
             StatusBadge.Text = "ERRO";
         }
@@ -141,7 +176,7 @@ public partial class MainWindow : Window
             ? "Processo: não conectado"
             : $"Processo: {_memory.Process.ProcessName}.exe | PID {_memory.Process.Id} | versão {version ?? "desconhecida"}";
 
-        var report = $"Game Trainer v0.2.1{Environment.NewLine}" +
+        var report = $"Game Trainer v0.2.3{Environment.NewLine}" +
                      $"{processInfo}{Environment.NewLine}" +
                      $"Status: {_module.RuntimeStatus}{Environment.NewLine}{Environment.NewLine}" +
                      _module.DiagnosticReport;
@@ -179,6 +214,13 @@ public partial class MainWindow : Window
         {
             SetToggleVisual(toggle, !enabled);
             TrainerStatusText.Text = "Inicie o Crimson Desert antes de ativar uma modificação.";
+            return;
+        }
+
+        if (!_module.IsRuntimeResolved && enabled)
+        {
+            SetToggleVisual(toggle, false);
+            TrainerStatusText.Text = "Aguarde a análise da memória terminar antes de ativar uma modificação.";
             return;
         }
 
@@ -237,6 +279,7 @@ public partial class MainWindow : Window
 
     protected override void OnClosed(EventArgs e)
     {
+        _isClosing = true;
         _processTimer.Stop();
         _trainerTimer.Stop();
 
